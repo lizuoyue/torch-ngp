@@ -314,6 +314,7 @@ class NeRFRenderer(nn.Module):
 
                 weights_sum, depth, image = raymarching.composite_rays_train(sigmas, rgbs, deltas, rays, T_thresh)
                 image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
+                results['depth_bound_scale'] = torch.clamp(depth, min=0).view(*prefix)
                 depth = torch.clamp(depth - nears, min=0) / (fars - nears)
                 image = image.view(*prefix, 3)
                 depth = depth.view(*prefix)
@@ -367,6 +368,7 @@ class NeRFRenderer(nn.Module):
                 step += n_step
 
             image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
+            results['depth_bound_scale'] = torch.clamp(depth, min=0).view(*prefix)
             depth = torch.clamp(depth - nears, min=0) / (fars - nears)
             image = image.view(*prefix, 3)
             depth = depth.view(*prefix)
@@ -483,6 +485,12 @@ class NeRFRenderer(nn.Module):
                             # assign 
                             tmp_grid[cas, indices] = sigmas
 
+                            # vis_mask = self.density_grid[cas, indices] > 10
+                            # with open(f'vis/query_occ.txt', 'w') as f:
+                            #     for (x, y, z) in cas_xyzs[vis_mask].cpu().numpy():
+                            #         f.write('%.3lf %.3lf %.3lf\n' % (z, x, y))
+                            # input("check")
+
         # partial update (half the computation)
         # TODO: why no need of maxpool ?
         else:
@@ -572,3 +580,55 @@ class NeRFRenderer(nn.Module):
             results = _run(rays_o, rays_d, **kwargs)
 
         return results
+    
+    @torch.no_grad()
+    def set_raymarching_density(self, S=128):
+        # call before each epoch to update extra states.
+
+        if not self.cuda_ray:
+            return 
+        
+        ### update density grid
+        self.reset_extra_state()
+        self.density_grid = -torch.ones_like(self.density_grid)
+        self.density_bitfield *= 0
+        density_thresh = 0.05
+        
+        # full update.
+        X = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
+        Y = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
+        Z = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
+
+        for xs in X:
+            for ys in Y:
+                for zs in Z:
+                    
+                    # construct points
+                    xx, yy, zz = custom_meshgrid(xs, ys, zs)
+                    coords = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1) # [N, 3], in [0, 128)
+                    indices = raymarching.morton3D(coords).long() # [N]
+                    xyzs = 2 * coords.float() / (self.grid_size - 1) - 1 # [N, 3] in [-1, 1]
+
+                    # cascading
+                    for cas in range(self.cascade):
+                        bound = min(2 ** cas, self.bound)
+                        half_grid_size = bound / self.grid_size
+                        # scale to current cascade's resolution
+                        cas_xyzs = xyzs * (bound - half_grid_size)
+                        # add noise in [-hgs, hgs]
+                        # cas_xyzs += (torch.rand_like(cas_xyzs) * 2 - 1) * half_grid_size
+                        # query density
+                        n_voxel = round(self.bound / half_grid_size)
+                        sigmas = self.density_query(cas_xyzs, n_voxel).reshape(-1).detach()
+                        # sigmas = self.density(cas_xyzs)['sigma'].reshape(-1).detach()
+                        # sigmas *= self.density_scale
+                        # assign 
+                        self.density_grid[cas, indices] = sigmas
+
+                        # vis_mask = self.density_grid[cas, indices] > density_thresh
+                        # with open(f'vis/query_occ_{cas}.txt', 'w') as f:
+                        #     for (x, y, z) in cas_xyzs[vis_mask].cpu().numpy():
+                        #         f.write('%.3lf %.3lf %.3lf\n' % (z, x, y))
+
+        # convert to bitfield
+        self.density_bitfield = raymarching.packbits(self.density_grid, density_thresh, self.density_bitfield)

@@ -91,6 +91,39 @@ def rand_poses(size, device, radius=1, theta_range=[np.pi/3, 2*np.pi/3], phi_ran
     return poses
 
 
+def get_circle_poses(radius, focus_distance, n_poses=30):
+    r, l = radius, focus_distance
+    poses = []
+    for i in range(n_poses):
+        theta = 2 * np.pi / n_poses * i
+        cos = np.cos(theta)
+        sin = np.sin(theta)
+        mat = np.array([
+            [l, 0, -r * cos, r * cos],
+            [0, l, -r * sin, r * sin],
+            [r * cos, r * sin, l, 0],
+            [0, 0, 0, 1],
+        ])
+        mat[:3, :3] /= (np.linalg.det(mat[:3, :3]) ** (1/3))
+        poses.append(np.linalg.inv(mat).astype(np.float32))
+    return poses
+
+
+def deps_to_camera_coord(deps, intrinsics):
+    # deps: [B, H, W, 1]
+    fx, fy, cx, cy = intrinsics.tolist()
+    B, H, W = deps.shape[:3]
+    y = torch.arange(H, device=deps.device)
+    x = torch.arange(W, device=deps.device)
+    y, x = torch.meshgrid(y, x) # AAA, BBB = torch.meshgrid(A, B)
+    px = (x + 0.5 - cx) / fx
+    px = torch.stack([px] * B, dim=0)
+    py = (y + 0.5 - cy) / fy
+    py = torch.stack([py] * B, dim=0)
+    pz = deps[..., 0]
+    return torch.stack([px * pz, py * pz, pz], dim=-1)
+
+
 class NeRFDataset:
     def __init__(self, opt, device, type='train', downscale=1, n_test=10):
         super().__init__()
@@ -161,9 +194,16 @@ class NeRFDataset:
         # read images
         frames = transform["frames"]
         #frames = sorted(frames, key=lambda d: d['file_path']) # why do I sort...
+        self.depths = None
+        if "z_near" in transform:
+            assert("z_far" in transform)
+            self.z_near = transform["z_near"]
+            self.z_far = transform["z_far"]
+            self.depths = []
+            self.coords = []
         
         # for colmap, manually interpolate a test set.
-        if self.mode == 'colmap' and type == 'test':
+        if self.mode == 'colmap' and False:#type == 'test':
             
             # choose two random poses, and interpolate between.
             f0, f1 = np.random.choice(frames, 2, replace=False)
@@ -180,15 +220,31 @@ class NeRFDataset:
                 pose[:3, :3] = slerp(ratio).as_matrix()
                 pose[:3, 3] = (1 - ratio) * pose0[:3, 3] + ratio * pose1[:3, 3]
                 self.poses.append(pose)
+            
+            circle_poses = get_circle_poses(0.03, 1.0) # local_circle to camera
+            self.poses = []
+            for frame in frames:
+                pose = nerf_matrix_to_ngp(np.array(frame['transform_matrix'], dtype=np.float32), scale=self.scale, offset=self.offset) # [4, 4]
+                self.poses += [pose @ cp for cp in circle_poses]
 
         else:
             # for colmap, manually split a valid set (the first frame).
             if self.mode == 'colmap':
                 if type == 'train':
-                    frames = frames[1:]
+                    # frames = frames[1:]
+                    frames = frames[:1520]
                 elif type == 'val':
-                    frames = frames[:1]
+                    # frames = frames[:1]
+                    frames = frames[1520:1600]
                 # else 'all' or 'trainval' : use all frames
+                else:
+                    assert(type == 'test')
+                    # frames = frames[1520:1600]
+                    # n_poses = 12
+                    # circle_poses = get_circle_poses(0.15, 10.0, n_poses) # local_circle to camera
+                    frames = [frames[1520-1+i] for i in [10,20,34,50,65]]
+                    n_poses = 1
+                    circle_poses = np.eye(4)[np.newaxis, ...].astype(np.float32)
             
             self.poses = []
             self.images = []
@@ -220,12 +276,28 @@ class NeRFDataset:
                     
                 image = image.astype(np.float32) / 255 # [H, W, 3/4]
 
+                if 'dep_path' in f:
+                    d_path = os.path.join(self.root_path, f['dep_path'])
+                    with np.load(d_path) as d_file:
+                        depth = d_file['depth']
+                    self.depths.append(depth)
+                    if type == 'test':
+                        self.depths += [depth] * (n_poses - 1)
+
                 self.poses.append(pose)
+                if type == 'test':
+                    self.poses.pop()
+                    self.poses += [pose @ cp for cp in circle_poses]
                 self.images.append(image)
+                if type == 'test':
+                    self.images += [image] * (n_poses - 1)
             
         self.poses = torch.from_numpy(np.stack(self.poses, axis=0)) # [N, 4, 4]
         if self.images is not None:
             self.images = torch.from_numpy(np.stack(self.images, axis=0)) # [N, H, W, C]
+        
+        if self.depths is not None:
+            self.depths = torch.from_numpy(np.stack(self.depths, axis=0)) # [N, H, W, 1]
         
         # calculate mean radius of all camera poses
         self.radius = self.poses[:, :3, 3].norm(dim=-1).mean(0).item()
@@ -252,6 +324,8 @@ class NeRFDataset:
                 else:
                     dtype = torch.float
                 self.images = self.images.to(dtype).to(self.device)
+            if self.depths is not None:
+                self.depths = self.depths.to(self.device)
             if self.error_map is not None:
                 self.error_map = self.error_map.to(self.device)
 
@@ -314,6 +388,36 @@ class NeRFDataset:
                 C = images.shape[-1]
                 images = torch.gather(images.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
             results['images'] = images
+        
+        if self.depths is not None:
+            images = self.images[index].to(self.device) # [B, H, W, 3/4]
+            depths = self.depths[index].to(self.device) # [B, H, W, 1]
+            masks = (self.z_near < depths[..., 0]) & (depths[..., 0] < self.z_far) # [B, H, W]
+            coords = deps_to_camera_coord(depths, self.intrinsics) # [B, H, W, 3]
+
+            results['pts_batch'] = torch.arange(B).to(self.device).repeat(self.H, self.W, 1).permute([2, 0, 1])
+            results['pts_coords'] = torch.matmul(
+                coords.view(B, self.H * self.W, 3),
+                poses[:, :3, :3].transpose(1, 2),
+            ).view(B, self.H, self.W, 3)
+            results['pts_coords'] = results['pts_coords'][..., [2, 0, 1]]
+            results['pts_masks'] = masks
+            results['pts_rgbs'] = images
+
+            # with open(f'vis/{self.count:04d}.txt', 'w') as f:
+            #     for (x, y, z), (r, g, b) in zip(
+            #         results['pts_coords'][results['pts_masks']].cpu().numpy(),
+            #         (255 * results['pts_rgbs'][results['pts_masks']].cpu().numpy()).astype(np.uint8),
+            #     ):
+            #         f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
+            # self.count += 1
+            # if self.count == 8:
+            #     input('check')
+
+            if self.training:
+                C = depths.shape[-1]
+                depths = torch.gather(depths.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 1]
+            results['depths'] = depths
         
         # need inds to update error_map
         if error_map is not None:

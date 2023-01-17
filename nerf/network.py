@@ -28,7 +28,19 @@ class NeRFNetwork(NeRFRenderer):
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
         self.geo_feat_dim = geo_feat_dim
-        self.encoder, self.in_dim = get_encoder(encoding, desired_resolution=2048 * bound)
+        # self.encoder, self.in_dim = get_encoder(encoding, desired_resolution=2048 * bound)
+
+        # self.encoder, self.in_dim = get_encoder("hashgrid_geo",
+        #     num_levels=6, level_dim=4, base_resolution=128,
+        #     desired_resolution=4096, log2_hashmap_size=19, align_corners=True)
+
+        # self.encoder, self.in_dim = get_encoder("hashgrid_minkowski",
+        #     num_levels=4, level_dim=8, base_resolution=256,
+        #     desired_resolution=2048, align_corners=False)
+
+        self.encoder, self.in_dim = get_encoder("hashgrid_minkowski_hierarchical",
+            num_levels=4, level_dim=8, base_resolution=256,
+            desired_resolution=2048, align_corners=False)
 
         sigma_net = []
         for l in range(num_layers):
@@ -141,6 +153,10 @@ class NeRFNetwork(NeRFRenderer):
             'sigma': sigma,
             'geo_feat': geo_feat,
         }
+    
+    def density_query(self, x, n_voxel):
+        # x: [N, 3], in [-bound, bound]
+        return self.encoder.density_query(x, bound=self.bound, n_voxel=n_voxel)
 
     def background(self, x, d):
         # x: [N, 2], in [-1, 1]

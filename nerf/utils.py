@@ -431,6 +431,29 @@ class Trainer(object):
         rays_o = data['rays_o'] # [B, N, 3]
         rays_d = data['rays_d'] # [B, N, 3]
 
+        if 'pts_batch' in data:
+            assert('pts_coords' in data)
+            assert('pts_masks' in data)
+            assert('pts_rgbs' in data)
+            assert(hasattr(self.model.encoder, 'pts_data'))
+            assert(hasattr(self.model.encoder, 'embeddings'))
+            # print(data['pts_batch'].shape) # [B, H, W]
+            # print(data['pts_coords'].shape) # [B, H, W, 3]
+            # print(data['pts_masks'].shape) # [B, H, W]
+            # print(data['pts_rgbs'].shape) # [B, H, W, 3]
+            # input("press to set new data")
+            self.model.encoder.pts_data = data
+            # {
+            #     'pts_coords': data['pts_coords'],
+            #     'pts_batch': data['pts_batch'],
+            #     'pts_masks': data['pts_masks'],
+            #     'pts_rgbs': data['pts_rgbs'],
+            # }
+            self.model.encoder.embeddings = None
+            self.model.encoder.density = {}
+            self.model.set_raymarching_density()
+            # self.model.encoder.count = 0
+
         # if there is no gt image, we train with CLIP loss.
         if 'images' not in data:
 
@@ -475,6 +498,24 @@ class Trainer(object):
 
         # MSE loss
         loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [B, N, 3] --> [B, N]
+
+        if 'depths' in data:
+            assert('depth_bound_scale' in outputs)
+            gt_dep = data['depths'][..., 0] / 32 # [B, N, (1)]
+            pred_dep = outputs['depth_bound_scale'] # [B, N]
+            # gt_dep / pred_dep == 32?
+            # print(gt_dep.shape, gt_dep.min(), gt_dep.max())
+            # print(pred_dep.shape, pred_dep.min(), pred_dep.max())
+            # for a, b in zip(gt_dep[0, :, 0], pred_dep[0]):
+            #     if a > 0 and b > 0:
+            #         print(a, b, a / b)
+            #         input()
+            mask = (0 < gt_dep) & (gt_dep < 2) & (0 < pred_dep) & (pred_dep < 2)
+            if mask.float().mean() > 0:
+                loss += torch.abs(gt_dep[mask] - pred_dep[mask]).mean()
+        else:
+            assert(False)
+
 
         # patch-based rendering
         if self.opt.patch_size > 1:
@@ -531,6 +572,18 @@ class Trainer(object):
         images = data['images'] # [B, H, W, 3/4]
         B, H, W, C = images.shape
 
+        if 'pts_batch' in data:
+            assert('pts_coords' in data)
+            assert('pts_masks' in data)
+            assert('pts_rgbs' in data)
+            assert(hasattr(self.model.encoder, 'pts_data'))
+            assert(hasattr(self.model.encoder, 'embeddings'))
+            self.model.encoder.pts_data = data
+            self.model.encoder.embeddings = None
+            self.model.encoder.density = {}
+            self.model.set_raymarching_density()
+            # self.model.encoder.count = 0
+
         if self.opt.color_space == 'linear':
             images[..., :3] = srgb_to_linear(images[..., :3])
 
@@ -556,6 +609,18 @@ class Trainer(object):
         rays_o = data['rays_o'] # [B, N, 3]
         rays_d = data['rays_d'] # [B, N, 3]
         H, W = data['H'], data['W']
+
+        if 'pts_batch' in data:
+            assert('pts_coords' in data)
+            assert('pts_masks' in data)
+            assert('pts_rgbs' in data)
+            assert(hasattr(self.model.encoder, 'pts_data'))
+            assert(hasattr(self.model.encoder, 'embeddings'))
+            self.model.encoder.pts_data = data
+            self.model.encoder.embeddings = None
+            self.model.encoder.density = {}
+            self.model.set_raymarching_density()
+            # self.model.encoder.count = 0
 
         if bg_color is not None:
             bg_color = bg_color.to(self.device)
@@ -670,8 +735,8 @@ class Trainer(object):
         if write_video:
             all_preds = np.stack(all_preds, axis=0)
             all_preds_depth = np.stack(all_preds_depth, axis=0)
-            imageio.mimwrite(os.path.join(save_path, f'{name}_rgb.mp4'), all_preds, fps=25, quality=8, macro_block_size=1)
-            imageio.mimwrite(os.path.join(save_path, f'{name}_depth.mp4'), all_preds_depth, fps=25, quality=8, macro_block_size=1)
+            imageio.mimwrite(os.path.join(save_path, f'{name}_rgb.mp4'), all_preds, fps=10, quality=8, macro_block_size=1)
+            imageio.mimwrite(os.path.join(save_path, f'{name}_depth.mp4'), all_preds_depth, fps=10, quality=8, macro_block_size=1)
 
         self.log(f"==> Finished Test.")
     
@@ -812,7 +877,7 @@ class Trainer(object):
         for data in loader:
             
             # update grid every 16 steps
-            if self.model.cuda_ray and self.global_step % self.opt.update_extra_interval == 0:
+            if False and self.model.cuda_ray and self.global_step % self.opt.update_extra_interval == 0:
                 with torch.cuda.amp.autocast(enabled=self.fp16):
                     self.model.update_extra_state()
                     

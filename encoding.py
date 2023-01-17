@@ -64,6 +64,18 @@ def get_encoder(encoding, input_dim=3,
         from gridencoder import GridEncoder
         encoder = GridEncoder(input_dim=input_dim, num_levels=num_levels, level_dim=level_dim, base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size, desired_resolution=desired_resolution, gridtype='hash', align_corners=align_corners)
     
+    elif encoding == 'hashgrid_geo':
+        from gridencoder import GridEncoderGeometry
+        encoder = GridEncoderGeometry(input_dim=input_dim, num_levels=num_levels, level_dim=level_dim, base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size, desired_resolution=desired_resolution, gridtype='hash', align_corners=align_corners)
+
+    elif encoding == 'hashgrid_minkowski':
+        from gridencoder import GridEncoderMinkowski
+        encoder = GridEncoderMinkowski(input_dim=input_dim, num_levels=num_levels, level_dim=level_dim, base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size, desired_resolution=desired_resolution, gridtype='hash', align_corners=align_corners)
+    
+    elif encoding == 'hashgrid_minkowski_hierarchical':
+        from gridencoder import GridEncoderMinkowskiHierarchical
+        encoder = GridEncoderMinkowskiHierarchical(input_dim=input_dim, num_levels=num_levels, level_dim=level_dim, base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size, desired_resolution=desired_resolution, gridtype='hash', align_corners=align_corners)
+    
     elif encoding == 'tiledgrid':
         from gridencoder import GridEncoder
         encoder = GridEncoder(input_dim=input_dim, num_levels=num_levels, level_dim=level_dim, base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size, desired_resolution=desired_resolution, gridtype='tiled', align_corners=align_corners)
