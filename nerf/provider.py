@@ -133,7 +133,7 @@ class NeRFDataset:
         self.type = type # train, val, test
         self.downscale = downscale
         self.root_path = opt.path
-        self.preload = opt.preload # preload data into GPU
+        self.preload = False#opt.preload # preload data into GPU
         self.scale = opt.scale # camera radius scale to make sure camera are inside the bounding box.
         self.offset = opt.offset # camera offset
         self.bound = opt.bound # bounding box half length, also used as the radius to random sample poses.
@@ -231,20 +231,56 @@ class NeRFDataset:
             # for colmap, manually split a valid set (the first frame).
             if self.mode == 'colmap':
                 if type == 'train':
-                    # frames = frames[1:]
-                    frames = frames[:1520]
+                    if opt.dataset_scale == 'tiny':
+                        frames = frames[30:31]
+                    elif opt.dataset_scale == 'small':
+                        frames = frames[:80]
+                    elif opt.dataset_scale == 'full':
+                        frames = frames[:1520]
+                    else:
+                        # raise Exception(f'Do not support given dataset_scale arg: {opt.dataset_scale}')
+                        a, b = opt.dataset_scale.split(",")
+                        frames = frames[int(a):int(b)]
                 elif type == 'val':
-                    # frames = frames[:1]
-                    frames = frames[1520:1600]
+                    if opt.dataset_scale == 'tiny':
+                        frames = frames[30:31]
+                    elif opt.dataset_scale == 'small':
+                        frames = frames[0:60:10] + frames[1525:1566:10]
+                    elif opt.dataset_scale == 'full':
+                        frames = frames[0:50:10] + frames[1520:1600]
+                    else:
+                        # raise Exception(f'Do not support given dataset_scale arg: {opt.dataset_scale}')
+                        a, b = opt.dataset_scale.split(",")
+                        frames = frames[int(a):int(b)]
                 # else 'all' or 'trainval' : use all frames
                 else:
                     assert(type == 'test')
-                    # frames = frames[1520:1600]
-                    # n_poses = 12
-                    # circle_poses = get_circle_poses(0.15, 10.0, n_poses) # local_circle to camera
-                    frames = [frames[1520-1+i] for i in [10,20,34,50,65]]
-                    n_poses = 1
-                    circle_poses = np.eye(4)[np.newaxis, ...].astype(np.float32)
+                    if opt.dataset_scale == 'tiny':
+                        raise NotImplementedError
+                    elif opt.dataset_scale == 'small':
+                        raise NotImplementedError
+                        frames = frames[:1]
+                        n_poses = 1
+                        circle_poses = np.eye(4)[np.newaxis, ...].astype(np.float32)
+                    elif opt.dataset_scale == 'full':
+                        n_poses = 24
+                        circle_poses = get_circle_poses(0.04, 8.0, n_poses) # local_circle to camera
+                        circle_poses.append(np.eye(4).astype(np.float32))
+                        n_poses += 1
+                        frames = [frames[1520-1+i] for i in [10,20,34,50,65]]#[10]*n_poses+[20]*n_poses+[34]*n_poses+[50]*n_poses+[65]*n_poses]
+                        # frames = [frames[i] for i in [0, 78, 79, 80, 81, 82]]#+[79]*n_poses+[80]*n_poses+[81]*n_poses+[82]*n_poses]
+                    else:
+                        n_poses = 12
+                        circle_poses = [np.eye(4).astype(np.float32)]
+                        circle_poses.extend(get_circle_poses(0.15, 10.0, n_poses)) # local_circle to camera
+                        n_poses += 1
+                        a, b = opt.dataset_scale.split(",")
+                        frames = frames[int(a):int(b)]
+                        # frames = frames[1520:1600]
+                        # frames = frames[:80]
+                        # frames = [frames[i] for i in [1]*11+[9]*11+[17]*11+[25]*11+[33]*11]
+                        # frames = [frames[1520-1+i] for i in [10,20,34,50,65]]
+                    
             
             self.poses = []
             self.images = []
@@ -258,9 +294,22 @@ class NeRFDataset:
                     continue
                 
                 pose = np.array(f['transform_matrix'], dtype=np.float32) # [4, 4]
+
+                # if opt.random_z_rotate:
+                #     rand_theta = np.random.rand() * 2 * np.pi
+                #     pose = np.array([
+                #         [np.cos(rand_theta), -np.sin(rand_theta), 0, 0],
+                #         [np.sin(rand_theta), np.cos(rand_theta), 0, 0],
+                #         [0, 0, 1, 0],
+                #         [0, 0, 0, 1],
+                #     ]).astype(np.float32) @ pose
+    
                 pose = nerf_matrix_to_ngp(pose, scale=self.scale, offset=self.offset)
 
                 image = cv2.imread(f_path, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
+                if opt.zero_input:
+                    image *= 0
+                    # image = np.random.randn(*image.shape)
                 if self.H is None or self.W is None:
                     self.H = image.shape[0] // downscale
                     self.W = image.shape[1] // downscale
@@ -271,8 +320,10 @@ class NeRFDataset:
                 else:
                     image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
 
+                resize = False
                 if image.shape[0] != self.H or image.shape[1] != self.W:
                     image = cv2.resize(image, (self.W, self.H), interpolation=cv2.INTER_AREA)
+                    resize = True
                     
                 image = image.astype(np.float32) / 255 # [H, W, 3/4]
 
@@ -280,6 +331,13 @@ class NeRFDataset:
                     d_path = os.path.join(self.root_path, f['dep_path'])
                     with np.load(d_path) as d_file:
                         depth = d_file['depth']
+                        if opt.constant_depth:
+                            depth *= 0
+                            depth += 3.0 # meter
+                        if resize:
+                            depth = cv2.resize(depth, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
+                            if len(depth.shape) == 2:
+                                depth = depth[..., np.newaxis]
                     self.depths.append(depth)
                     if type == 'test':
                         self.depths += [depth] * (n_poses - 1)
@@ -291,6 +349,22 @@ class NeRFDataset:
                 self.images.append(image)
                 if type == 'test':
                     self.images += [image] * (n_poses - 1)
+        
+        # if type == 'test':
+        #     for i in range(0, len(self.poses), n_poses):
+        #         # interp between self.poses[i], self.poses[i+n_poses]
+        #         j = (i + n_poses) % len(self.poses)
+        #         rots = Rotation.from_matrix(np.stack([self.poses[i][:3, :3], self.poses[j][:3, :3]]))
+        #         slerp = Slerp([0, 1], rots)
+        #         for k in range(1, n_poses):
+        #             ratio = np.sin((k / n_poses - 0.5) * np.pi) * 0.5 + 0.5
+        #             pose = np.eye(4, dtype=np.float32)
+        #             pose[:3, :3] = slerp(ratio).as_matrix()
+        #             pose[:3, 3] = (1 - ratio) * self.poses[i][:3, 3] + ratio * self.poses[j][:3, 3]
+        #             self.poses[i + k] = pose
+        #     # self.poses = self.poses[::n_poses] + self.poses
+        #     # self.depths = self.depths[::n_poses] + self.depths
+        #     # self.images = self.images[::n_poses] + self.images
             
         self.poses = torch.from_numpy(np.stack(self.poses, axis=0)) # [N, 4, 4]
         if self.images is not None:
@@ -404,15 +478,14 @@ class NeRFDataset:
             results['pts_masks'] = masks
             results['pts_rgbs'] = images
 
-            # with open(f'vis/{self.count:04d}.txt', 'w') as f:
+            # with open(f'vis/{index[0]:04d}.txt', 'w') as f:
             #     for (x, y, z), (r, g, b) in zip(
             #         results['pts_coords'][results['pts_masks']].cpu().numpy(),
             #         (255 * results['pts_rgbs'][results['pts_masks']].cpu().numpy()).astype(np.uint8),
             #     ):
             #         f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
-            # self.count += 1
-            # if self.count == 8:
-            #     input('check')
+
+            # input('check')
 
             if self.training:
                 C = depths.shape[-1]
@@ -431,6 +504,12 @@ class NeRFDataset:
         if self.training and self.rand_pose > 0:
             size += size // self.rand_pose # index >= size means we use random pose.
         loader = DataLoader(list(range(size)), batch_size=1, collate_fn=self.collate, shuffle=self.training, num_workers=0)
+        loader._data = self # an ugly fix... we need to access error_map & poses in trainer.
+        loader.has_gt = self.images is not None
+        return loader
+    
+    def dataloader_my(self, batch_size):
+        loader = DataLoader(list(range(len(self.poses))), batch_size=batch_size, collate_fn=self.collate, shuffle=False, num_workers=0)
         loader._data = self # an ugly fix... we need to access error_map & poses in trainer.
         loader.has_gt = self.images is not None
         return loader

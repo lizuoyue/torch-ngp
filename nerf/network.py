@@ -2,14 +2,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from encoding import get_encoder
+from encoding import get_encoder, get_disc, get_z_encoder
 from activation import trunc_exp
 from .renderer import NeRFRenderer
 
 
 class NeRFNetwork(NeRFRenderer):
     def __init__(self,
-                 encoding="hashgrid",
+                 encoding,
+                 embedding_net,
+                 embedding_regu,
+                 pts_scale,
                  encoding_dir="sphere_harmonics",
                  encoding_bg="hashgrid",
                  num_layers=2,
@@ -20,6 +23,7 @@ class NeRFNetwork(NeRFRenderer):
                  num_layers_bg=2,
                  hidden_dim_bg=64,
                  bound=1,
+                 activation='relu',
                  **kwargs,
                  ):
         super().__init__(bound, **kwargs)
@@ -28,6 +32,7 @@ class NeRFNetwork(NeRFRenderer):
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
         self.geo_feat_dim = geo_feat_dim
+        self.activation = activation
         # self.encoder, self.in_dim = get_encoder(encoding, desired_resolution=2048 * bound)
 
         # self.encoder, self.in_dim = get_encoder("hashgrid_geo",
@@ -38,9 +43,16 @@ class NeRFNetwork(NeRFRenderer):
         #     num_levels=4, level_dim=8, base_resolution=256,
         #     desired_resolution=2048, align_corners=False)
 
-        self.encoder, self.in_dim = get_encoder("hashgrid_minkowski_hierarchical",
+        self.encoder, self.in_dim = get_encoder(encoding,   # is 'hashgrid_minkowski_hierarchical' defaultly
+            embeding_net=embedding_net, embedding_regu=embedding_regu,
             num_levels=4, level_dim=8, base_resolution=256,
-            desired_resolution=2048, align_corners=False)
+            desired_resolution=2048, align_corners=False, pts_scale=pts_scale)
+        
+        if embedding_net == "stylegan":
+            self.disc = get_disc()
+        elif embedding_net == 'bicyclegan':
+            self.disc = get_disc()
+            self.z_encoder = get_z_encoder()
 
         sigma_net = []
         for l in range(num_layers):
@@ -115,20 +127,25 @@ class NeRFNetwork(NeRFRenderer):
         for l in range(self.num_layers):
             h = self.sigma_net[l](h)
             if l != self.num_layers - 1:
-                h = F.relu(h, inplace=True)
+                if self.activation == 'relu':
+                    h = F.relu(h, inplace=True)
+                elif self.activation == 'lrelu':
+                    h = F.leaky_relu(h, negative_slope=0.2, inplace=True)
 
         #sigma = F.relu(h[..., 0])
         sigma = trunc_exp(h[..., 0])
         geo_feat = h[..., 1:]
 
         # color
-        
         d = self.encoder_dir(d)
         h = torch.cat([d, geo_feat], dim=-1)
         for l in range(self.num_layers_color):
             h = self.color_net[l](h)
             if l != self.num_layers_color - 1:
-                h = F.relu(h, inplace=True)
+                if self.activation == 'relu':
+                    h = F.relu(h, inplace=True)
+                elif self.activation == 'lrelu':
+                    h = F.leaky_relu(h, negative_slope=0.2, inplace=True)
         
         # sigmoid activation for rgb
         color = torch.sigmoid(h)
@@ -208,7 +225,6 @@ class NeRFNetwork(NeRFRenderer):
 
     # optimizer utils
     def get_params(self, lr):
-
         params = [
             {'params': self.encoder.parameters(), 'lr': lr},
             {'params': self.sigma_net.parameters(), 'lr': lr},

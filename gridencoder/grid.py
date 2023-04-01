@@ -2,6 +2,7 @@ import numpy as np
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 from torch.cuda.amp import custom_bwd, custom_fwd 
@@ -9,6 +10,11 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 import MinkowskiEngine as ME
 from .resfieldnet import ResFieldNet50Hierarchical
 from .resfieldnet import ResNet50
+from .minkvae import MinkVAE
+from .minkfieldunet import MinkFieldUNet50Small, MinkFieldUNet14A
+from .style_unet import StyleFieldUNet50Small, StyleFieldUNet14A
+# from .stylegan2_3d import StyleGAN2_3D_Generator
+from .stylegan1_3d import StyleGAN2_3D_Generator
 
 try:
     import _gridencoder as _backend
@@ -199,11 +205,25 @@ class GridEncoderGeometry(nn.Module):
 
 def replace_features(x, features):
     assert(x.F.shape[0] == features.shape[0])
-    return ME.SparseTensor(
-        features=features,
-        coordinate_manager=x.coordinate_manager,
-        coordinate_map_key=x.coordinate_map_key,
-    )
+    if isinstance(x, ME.TensorField):
+        return ME.TensorField(
+            features=features.to(x.device),
+            coordinate_field_map_key=x.coordinate_field_map_key,
+            coordinate_manager=x.coordinate_manager,
+            quantization_mode=x.quantization_mode,
+            device=x.device,
+        )
+    elif isinstance(x, ME.SparseTensor):
+        return ME.SparseTensor(
+            features=features.to(x.device),
+            coordinate_map_key=x.coordinate_map_key,
+            coordinate_manager=x.coordinate_manager,
+            device=x.device,
+        )
+    else:
+        pass
+    raise ValueError("Input tensor is not ME.TensorField nor ME.SparseTensor.")
+    return None
 
 
 class GridEncoderMinkowski(nn.Module):
@@ -283,7 +303,9 @@ class GridEncoderMinkowski(nn.Module):
 
 
 class GridEncoderMinkowskiHierarchical(nn.Module):
-    def __init__(self, input_dim=3, num_levels=16, level_dim=2, per_level_scale=2, base_resolution=16, log2_hashmap_size=19, desired_resolution=None, gridtype='hash', align_corners=False):
+    def __init__(self, input_dim=3, num_levels=16, level_dim=2, per_level_scale=2, base_resolution=16,
+                log2_hashmap_size=19, desired_resolution=None, gridtype='hash', align_corners=False, 
+                embedding_net='unet', embedding_regu='none', scale=20):
         super().__init__()
 
         # the finest resolution desired at the last level, if provided, overridee per_level_scale
@@ -301,12 +323,14 @@ class GridEncoderMinkowskiHierarchical(nn.Module):
         self.gridtype_id = _gridtype_to_id[gridtype] # "tiled" or "hash"
         self.align_corners = align_corners
         self.dual = False
+        self.embedding_net = embedding_net
+        self.embedding_regu = embedding_regu
 
         self.aabb_size = 128 # meter, front 64m back 64m left 64m right 64m
         # self.scale = 80
         # for voxel sizes 0.1, 0.2, 0.4, and 0.8
         # originally 1/80, become 1/10 after 3 downsamples
-        self.scale = 160
+        self.scale = scale
         # for voxel sizes 0.05, 0.1, 0.2, and 0.4
         # originally 1/160, become 1/20 after 3 downsamples
         # self.scale = 240
@@ -319,14 +343,41 @@ class GridEncoderMinkowskiHierarchical(nn.Module):
             self.scale_dual = self.scale * np.sqrt(2)
             # self.output_dim *= 2
         else:
-            self.net = ResFieldNet50Hierarchical(3, 8)
-        # self.net = ResNet50(3, 8)
+            if self.embedding_net == 'resnet':
+                self.net = ResFieldNet50Hierarchical(3, 8)
+            elif self.embedding_net == 'unet14':
+                print('********************** Using UNet14 **********************')
+                self.net = MinkFieldUNet14A(3, 8)
+            elif self.embedding_net == 'unet14single':
+                print('********************** Using UNet14 **********************')
+                self.net = MinkFieldUNet14A(3, 32)
+            elif self.embedding_net == 'minkvae':
+                print('********************** Using MinkVAE **********************')
+                self.net = MinkVAE(3, 64, 64, 8)
+            elif self.embedding_net == 'unet50':
+                print('********************** Using UNet50 **********************')
+                self.net = MinkFieldUNet50Small(3, 8)
+            elif self.embedding_net == 'stylegan':
+                print('********************** Using StyleGAN2_3D **********************')
+                self.net = StyleGAN2_3D_Generator(z_dim=128, w_dim=128, num_blocks=5, 
+                                num_latent_mapping_layers=4, feature_out_channels=8, init_seed_channels=8)
+            elif self.embedding_net == 'styleunet':
+                print('********************** Using StyleUNet14 **********************')
+                self.net = StyleFieldUNet14A(3, 8, z_dim=128, w_dim=128, D=3)
+            elif self.embedding_net == 'bicyclegan':
+                print('********************** Using Bicycle-StyleGAN **********************')
+                self.net = StyleGAN2_3D_Generator(z_dim=128, w_dim=128, num_blocks=5,
+                                num_latent_mapping_layers=4, feature_out_channels=8, init_seed_channels=8)
+
+
         self.pts_data = None
         self.embeddings = None
+        self.posterior = None
         self.density = {}
         self.count = None
         self.emb_count = 0
-
+        self.time_count = 900
+        self.z_mu, self.z_logvar = None, None
 
     def __repr__(self):
         return f"GridEncoderMinkowskiHierarchical: input_dim={self.input_dim} num_levels={self.num_levels} level_dim={self.level_dim} resolution={self.base_resolution} -> {int(round(self.base_resolution * self.per_level_scale ** (self.num_levels - 1)))} per_level_scale={self.per_level_scale:.4f} params={[(name, tuple(param.shape)) for name, param in self.named_parameters()]} gridtype={self.gridtype} align_corners={self.align_corners}"
@@ -342,7 +393,7 @@ class GridEncoderMinkowskiHierarchical(nn.Module):
         func = lambda x: torch.cat([x, x[:1]], dim=0)
         if self.embeddings is None:
             pts = self.pts_data['pts_coords'][self.pts_data['pts_masks']]
-            pts_batch = self.pts_data['pts_batch'][self.pts_data['pts_masks']].unsqueeze(-1)
+            pts_batch = self.pts_data['pts_batch'][self.pts_data['pts_masks']].unsqueeze(-1) * 0
             pts_field = ME.TensorField(
                 features=func(self.pts_data['pts_rgbs'][self.pts_data['pts_masks']]),
                 coordinates=func(torch.cat([pts_batch, pts * self.scale], dim=-1)),
@@ -350,17 +401,102 @@ class GridEncoderMinkowskiHierarchical(nn.Module):
                 minkowski_algorithm=ME.MinkowskiAlgorithm.SPEED_OPTIMIZED,
                 device=pts.device,
             )
+            # func1 = lambda x: torch.cat([torch.zeros_like(x[:, :1]), x], dim=1)
+            # mat = np.loadtxt("/home/lzq/lzy/denoising-diffusion-pytorch/test190dataaug/datavis/gamma_epoch20/data_3.txt")
+            # pts_field = ME.TensorField(
+            #     features=func(torch.from_numpy(mat[:, 3:]).to(pts.device).float() / 255.0),
+            #     coordinates=func(func1(torch.from_numpy(mat[:, :3]).to(pts.device).int())),
+            #     quantization_mode=ME.SparseTensorQuantizationMode.UNWEIGHTED_AVERAGE,
+            #     minkowski_algorithm=ME.MinkowskiAlgorithm.SPEED_OPTIMIZED,
+            #     device=pts.device,
+            # )
+
             # print('  Compute embeddings')
             self.pts_sparse = pts_field#.sparse()
-            self.embeddings = self.net(self.pts_sparse)
+            if self.embedding_net == 'stylegan':
+                z = torch.randn(pts_batch.max()+1, self.net.z_dim).to(pts.device)
+                self.embeddings = self.net(self.pts_sparse.sparse(), z=z, update_emas=False)
+            elif self.embedding_net == 'styleunet':
+                z = torch.randn(pts_batch.max()+1, self.net.z_dim).to(pts.device)
+                self.embeddings = self.net(self.pts_sparse, z=z)
+            elif self.embedding_net == 'bicyclegan':
+                if self.z_mu and self.z_logvar:
+                    std = torch.exp(self.z_logvar / 2)
+                    z = torch.normal(mean=self.z_mu, std=std).to(pts.device)
+                else:
+                    z = torch.randn(pts_batch.max()+1, self.net.z_dim).to(pts.device)
+                self.embeddings = self.net(self.pts_sparse, z=z)
+            elif self.embedding_net == 'minkvae':
+                self.embeddings, self.posterior = self.net(self.pts_sparse)
+            else:
+                self.embeddings = self.net(self.pts_sparse)
+            # for emb in self.embeddings:
+            #     print(emb.F.shape)
 
-            to_save = {
-                "features": [emb.F for emb in self.embeddings],
-                "coordinates": [emb.C for emb in self.embeddings],
-            }
+            if self.embedding_regu == 'tanh':
+                self.embeddings = tuple([replace_features(embedding, F.tanh(embedding.F)) for embedding in self.embeddings])
+            elif self.embedding_regu == 'normal':
+                def gaussian_norm(net_output):
+                    mu = torch.mean(net_output, dim=0)
+                    sigma = torch.std(net_output, dim=0)
+                    return torch.clamp((net_output - mu) / sigma, -3.0, 3.0)
+                self.embeddings = tuple([replace_features(embedding, gaussian_norm(embedding.F)) for embedding in self.embeddings])
+            elif self.embedding_regu == 'normal_loss':
+                self.emb_mus = [torch.mean(embedding.F, dim=0) for embedding in self.embeddings]
+                self.emb_vars = [torch.var(embedding.F, dim=0) for embedding in self.embeddings]
+            else:
+                assert(self.embedding_regu == 'none')
 
-            torch.save(to_save, f'embeddings+holicity+fineres+fieldnet/{self.emb_count}.pt')
-            self.emb_count += 1
+            if False:
+                to_save = {
+                    "features": [emb.F for emb in self.embeddings],
+                    "coordinates": [emb.C for emb in self.embeddings],
+                }
+
+                torch.save(to_save, f'embeddings+minkunet14_gau_20/{self.emb_count}.pt')
+                self.emb_count += 1
+            
+            if False:
+                print("Load emb from file")
+                if self.time_count == -100:
+                    self.emb_count += 1
+                    self.time_count = 900
+                filename = f'embeddings+minkunet14_20/pred_{self.emb_count}_{self.time_count}1stlayer.pt'
+                low_to_high = False
+                # filename = f'embeddings+holicity+fineres+fieldnet/overfit0/pred_0_clip8_{self.emb_count}.pt'
+                # filename = f'embeddings+minkunet14_gau_20/{self.emb_count}.pt'
+                # filename = f'embeddings+minkunet14_tanh_20/pred_4_{self.emb_count}_overfit5.pt'
+                d = torch.load(filename)
+                self.time_count -= 100
+                if self.time_count == 0:
+                    self.time_count = 1
+                if self.time_count == -99:
+                    self.time_count = 0
+                # self.emb_count += 1
+                embs = []
+                stride = 8 if low_to_high else 1
+                for fts, coords in zip(d["features"], d["coordinates"]):
+                    embs.append(
+                        ME.SparseTensor(
+                            fts, coordinates=coords, device=d["features"][0].device, tensor_stride=stride,
+                            coordinate_manager=embs[0].coordinate_manager if len(embs) else None,
+                        )
+                    )
+                    # print(embs[-1].F.min(dim=0))
+                    # print(embs[-1].F.max(dim=0))
+                    # print(embs[-1].F.shape)
+                    # input()
+                    if low_to_high:
+                        stride *= 2
+                    else:
+                        stride //= 2
+                
+                if low_to_high:
+                    self.embeddings = tuple(embs)
+                else:
+                    print("here")
+                    # self.embeddings = tuple(embs[::-1])
+                    self.embeddings = self.embeddings[:-1] + (embs[0], )
 
             if self.dual:
                 pts_field = ME.TensorField(
@@ -400,8 +536,12 @@ class GridEncoderMinkowskiHierarchical(nn.Module):
         query = torch.cat([torch.zeros(*(prefix_shape + [1]), device=inputs.device), query], dim=-1)
         query = query.view(-1, 4)
         outputs = []
-        for embedding in self.embeddings:
-            outputs.append(embedding.features_at_coordinates(query).view(*prefix_shape, -1))
+
+        if self.embedding_net.endswith("single"):
+            outputs.append(self.embeddings[-1].features_at_coordinates(query).view(*prefix_shape, -1))
+        else:
+            for embedding in self.embeddings:
+                outputs.append(embedding.features_at_coordinates(query).view(*prefix_shape, -1))
         
         if self.dual:
             query *= float(np.sqrt(2))
@@ -417,21 +557,24 @@ class GridEncoderMinkowskiHierarchical(nn.Module):
         assert(self.pts_data is not None)
         assert(type(self.density) == dict)
         func = lambda x: torch.cat([x, x[:1]], dim=0)
-        # offset = torch.Tensor([
-        #     [0, 0, 0, 0],
-        #     [0, 0, 0, 1],
-        #     [0, 0, 1, 0],
-        #     [0, 0, 1, 1],
-        #     [0, 1, 0, 0],
-        #     [0, 1, 0, 1],
-        #     [0, 1, 1, 0],
-        #     [0, 1, 1, 1],
-        # ]).to(inputs.device)
+        offset = torch.Tensor([
+            [0, 0, 0, 0],
+            [0, 0, 0, 1],
+            [0, 0, 1, 0],
+            [0, 0, 1, 1],
+            [0, 1, 0, 0],
+            [0, 1, 0, 1],
+            [0, 1, 1, 0],
+            [0, 1, 1, 1],
+        ]).to(inputs.device)
         if n_voxel not in self.density:
             pts = self.pts_data['pts_coords'][self.pts_data['pts_masks']]
-            pts_batch = self.pts_data['pts_batch'][self.pts_data['pts_masks']].unsqueeze(-1)
+            pts_batch = self.pts_data['pts_batch'][self.pts_data['pts_masks']].unsqueeze(-1) * 0
             coords = func(torch.cat([pts_batch, pts / self.aabb_size * n_voxel], dim=-1))
-            # coords = torch.repeat_interleave(torch.floor(coords), 8, dim=0) + offset.repeat(coords.shape[0], 1)
+            # mat = np.loadtxt("/home/lzq/lzy/denoising-diffusion-pytorch/test190dataaug/datavis/gamma_epoch20/data_3.txt")
+            # coords = (torch.from_numpy(mat[:, :3]) / self.scale).to(pts.device).float()
+            # coords = func(torch.cat([torch.zeros_like(coords[:, :1]), coords / self.aabb_size * n_voxel], dim=-1))
+            coords = torch.repeat_interleave(torch.floor(coords), 8, dim=0) + offset.repeat(coords.shape[0], 1)
             self.density[n_voxel] = ME.TensorField(
                 features=torch.ones_like(coords[:, :1]),
                 coordinates=coords,

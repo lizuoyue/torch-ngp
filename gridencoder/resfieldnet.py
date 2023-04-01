@@ -259,4 +259,5 @@ class ResFieldNet50Hierarchical(ResFieldNetBase):
     BLOCK = BottleneckInstanceNorm
     LAYERS = (3, 4, 6, 3)
     PLANES = (32, 64, 128, 128)
+    # PLANES = (32, 64, 128, 256)
 

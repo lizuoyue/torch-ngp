@@ -1,16 +1,9 @@
 import torch
 import argparse
 
-from nerf.provider import NeRFDataset
-from nerf.gui import NeRFGUI
-from nerf.utils import *
-
-from functools import partial
-from loss import huber_loss
-
 #torch.autograd.set_detect_anomaly(True)
 
-if __name__ == '__main__':
+def get_args():
 
     parser = argparse.ArgumentParser()
     parser.add_argument('path', type=str)
@@ -22,7 +15,7 @@ if __name__ == '__main__':
     ### training options
     parser.add_argument('--iters', type=int, default=30000, help="training iters")
     parser.add_argument('--lr', type=float, default=1e-2, help="initial learning rate")
-    parser.add_argument('--ckpt', type=str, default='latest')
+    parser.add_argument('--ckpt', type=str, default='latest', choices=['latest', 'latest_model', 'best'])
     parser.add_argument('--num_rays', type=int, default=4096, help="num rays sampled per image for each training step")
     parser.add_argument('--cuda_ray', action='store_true', help="use CUDA raymarching instead of pytorch")
     parser.add_argument('--max_steps', type=int, default=1024, help="max num steps sampled per ray (only valid when using --cuda_ray)")
@@ -31,12 +24,43 @@ if __name__ == '__main__':
     parser.add_argument('--update_extra_interval', type=int, default=16, help="iter interval to update extra status (only valid when using --cuda_ray)")
     parser.add_argument('--max_ray_batch', type=int, default=4096, help="batch size of rays at inference to avoid OOM (only valid when NOT using --cuda_ray)")
     parser.add_argument('--patch_size', type=int, default=1, help="[experimental] render patches in training, so as to apply LPIPS loss. 1 means disabled, use [64, 32, 16] to enable")
+    parser.add_argument('--lr_decay', type=str, default="step_exp", 
+                        choices=["none", "step_exp", "epoch_exp", "epoch_onplateau"])
 
     ### network backbone options
     parser.add_argument('--fp16', action='store_true', help="use amp mixed precision training")
     parser.add_argument('--ff', action='store_true', help="use fully-fused MLP")
     parser.add_argument('--tcnn', action='store_true', help="use TCNN backend")
+    parser.add_argument('--encoding_net', type=str, default='hashgrid_minkowski_hierarchical', 
+                        choices=['hashgrid_minkowski_hierarchical'])
+    parser.add_argument('--embedding_net', type=str, default='resnet', 
+                        choices=['resnet', 'unet50', 'unet14', 'unet14single', 'stylegan', 'styleunet', 'bicyclegan', "minkvae"])
+    parser.add_argument('--embedding_regu', type=str, default='none', choices=['none', 'normal', 'tanh', 'normal_loss'])
+    parser.add_argument('--nerf_act', type=str, default='relu', choices=['lrelu', 'relu'])
+    parser.add_argument('--downscale', type=int, default=1)
+    parser.add_argument('--pts_scale', type=int, default=20)
+    parser.add_argument('--depth_loss_weight', type=float, default=0.0)
+    parser.add_argument('--color_loss_weight', type=float, default=1.0)
+    parser.add_argument('--kl_loss_weight', type=float, default=0.0)
+    parser.add_argument('--r1_gamma', type=float, default=0.0)
 
+    ### StyleGAN2 options
+    parser.add_argument('--no_disc', action='store_true', help="deactivate discriminator if using stylegan")
+
+    ### Debug options
+    parser.add_argument('--dataset_scale', type=str, default='full')#, choices=['tiny', 'small', 'full'])
+    parser.add_argument('--constant_depth', action='store_true')
+    parser.add_argument('--zero_input', action='store_true')
+    parser.add_argument('--random_x_flip', action='store_true')
+    parser.add_argument('--random_y_flip', action='store_true')
+    parser.add_argument('--random_z_rotate', action='store_true')
+    parser.add_argument('--random_gamma_correction', action='store_true')
+    parser.add_argument('--diff_arg_dataset', type=str, default='train')
+    parser.add_argument('--diff_arg_net_attention', type=str, default=None)
+    parser.add_argument('--diff_arg_folder', type=str)
+    parser.add_argument('--diff_arg_ckpt', type=str, default=None)
+    parser.add_argument('--diff_arg_sampling_steps', type=int, default=1000)
+    
     ### dataset options
     parser.add_argument('--color_space', type=str, default='srgb', help="Color space, supports (linear, srgb)")
     parser.add_argument('--preload', action='store_true', help="preload all data into GPU, accelerate training but use more GPU memory")
@@ -62,7 +86,18 @@ if __name__ == '__main__':
     parser.add_argument('--clip_text', type=str, default='', help="text input for CLIP guidance")
     parser.add_argument('--rand_pose', type=int, default=-1, help="<0 uses no rand pose, =0 only uses rand pose, >0 sample one rand pose every $ known poses")
 
-    opt = parser.parse_args()
+    return parser.parse_args()
+
+if __name__ == '__main__':
+
+    from nerf.provider import NeRFDataset
+    from nerf.gui import NeRFGUI
+    from nerf.utils import *
+
+    from functools import partial
+    from loss import huber_loss
+
+    opt = get_args()
 
     if opt.O:
         opt.fp16 = True
@@ -91,13 +126,17 @@ if __name__ == '__main__':
     seed_everything(opt.seed)
 
     model = NeRFNetwork(
-        encoding="hashgrid",
+        encoding=opt.encoding_net, # is 'hashgrid_minkowski_hierarchical' defaultly
+        embedding_net=opt.embedding_net,
+        embedding_regu=opt.embedding_regu,
+        pts_scale=opt.pts_scale,
         bound=opt.bound,
         cuda_ray=opt.cuda_ray,
         density_scale=1,
         min_near=opt.min_near,
         density_thresh=opt.density_thresh,
         bg_radius=opt.bg_radius,
+        activation=opt.nerf_act,
     )
     
     print(model)
@@ -118,7 +157,7 @@ if __name__ == '__main__':
             gui.render()
         
         else:
-            test_loader = NeRFDataset(opt, device=device, type='test').dataloader()
+            test_loader = NeRFDataset(opt, device=device, type='test', downscale=opt.downscale).dataloader()
 
             if test_loader.has_gt:
                 pass
@@ -132,26 +171,45 @@ if __name__ == '__main__':
 
         optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15)
 
-        train_loader = NeRFDataset(opt, device=device, type='train').dataloader()
+        train_loader = NeRFDataset(opt, device=device, type='train', downscale=opt.downscale).dataloader()
 
-        # decay to 0.1 * init_lr at last iter step
-        scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / opt.iters, 1))
+        if opt.lr_decay == "step_exp":
+            # decay to 0.1 * init_lr at last iter step
+            scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, 
+                            lambda iter: 0.1 ** min(iter / opt.iters, 1))
+            scheduler_update_every_step = True
+        elif opt.lr_decay == "epoch_exp":
+            num_epochs = opt.iters // len(train_loader)
+            scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, 
+                            lambda epoch: 1.0 ** min(epoch / num_epochs, 1))
+            scheduler_update_every_step = False
+        elif opt.lr_decay == "epoch_onplateau":
+            scheduler = lambda optimizer: optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
+            scheduler_update_every_step = False
+        else:
+            scheduler = None
+            scheduler_update_every_step = False
+        # elif opt.lr_decay == "epoch_given":
+        #     scheduler = lambda optimizer: optim.lr_scheduler.MultiStepLR(optimizer, [])
 
         metrics = [PSNRMeter(), LPIPSMeter(device=device)]
-        trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, optimizer=optimizer, criterion=criterion, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, scheduler_update_every_step=True, metrics=metrics, use_checkpoint=opt.ckpt)#, eval_interval=50)
+        trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, 
+                    optimizer=optimizer, criterion=criterion, ema_decay=0.95, fp16=opt.fp16, 
+                    lr_scheduler=scheduler, scheduler_update_every_step=scheduler_update_every_step, 
+                    metrics=metrics, use_checkpoint=opt.ckpt)#, eval_interval=50)
 
         if opt.gui:
             gui = NeRFGUI(opt, trainer, train_loader)
             gui.render()
         
         else:
-            valid_loader = NeRFDataset(opt, device=device, type='val', downscale=1).dataloader()
+            valid_loader = NeRFDataset(opt, device=device, type='val', downscale=opt.downscale).dataloader()
 
             max_epoch = np.ceil(opt.iters / len(train_loader)).astype(np.int32)
             trainer.train(train_loader, valid_loader, max_epoch)
 
             # also test
-            test_loader = NeRFDataset(opt, device=device, type='test').dataloader()
+            test_loader = NeRFDataset(opt, device=device, type='test', downscale=opt.downscale).dataloader()
             
             if test_loader.has_gt:
                 trainer.evaluate(test_loader) # blender has gt, so evaluate it.

@@ -42,7 +42,11 @@ class FreqEncoder(nn.Module):
 
         return out
 
-def get_encoder(encoding, input_dim=3, 
+def get_encoder(encoding, 
+                embeding_net='unet', 
+                embedding_regu='none',
+                pts_scale=20,
+                input_dim=3, 
                 multires=6, 
                 degree=4,
                 num_levels=16, level_dim=2, base_resolution=16, log2_hashmap_size=19, desired_resolution=2048, align_corners=False,
@@ -74,7 +78,7 @@ def get_encoder(encoding, input_dim=3,
     
     elif encoding == 'hashgrid_minkowski_hierarchical':
         from gridencoder import GridEncoderMinkowskiHierarchical
-        encoder = GridEncoderMinkowskiHierarchical(input_dim=input_dim, num_levels=num_levels, level_dim=level_dim, base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size, desired_resolution=desired_resolution, gridtype='hash', align_corners=align_corners)
+        encoder = GridEncoderMinkowskiHierarchical(input_dim=input_dim, num_levels=num_levels, level_dim=level_dim, base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size, desired_resolution=desired_resolution, gridtype='hash', align_corners=align_corners, embedding_net=embeding_net, embedding_regu=embedding_regu, scale=pts_scale)
     
     elif encoding == 'tiledgrid':
         from gridencoder import GridEncoder
@@ -88,3 +92,11 @@ def get_encoder(encoding, input_dim=3,
         raise NotImplementedError('Unknown encoding mode, choose from [None, frequency, sphere_harmonics, hashgrid, tiledgrid]')
 
     return encoder, encoder.output_dim
+
+def get_disc():
+    from gridencoder.stylegan1_3d import StyleGAN2_2D_Discriminator
+    return StyleGAN2_2D_Discriminator(num_blocks=4, use_batch_norm=False, use_spectral_norm=True)
+
+def get_z_encoder():
+    from gridencoder.stylegan1_3d import Latent_2D_Encoder
+    return Latent_2D_Encoder(z_dim=128)

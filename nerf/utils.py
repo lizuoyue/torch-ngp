@@ -337,14 +337,38 @@ class Trainer(object):
             self.criterion_lpips = lpips.LPIPS(net='alex').to(self.device)
 
         if optimizer is None:
+            # raise Exception(f'Discriminator network does not support without optimizer: {optimizer}.')
+            # assert(False)
             self.optimizer = optim.Adam(self.model.parameters(), lr=0.001, weight_decay=5e-4) # naive adam
         else:
             self.optimizer = optimizer(self.model)
+        
+        if opt.embedding_net == "stylegan" and not opt.no_disc:
+            assert(hasattr(self.model, "disc"))
+            print(f"========= Use discriminator. =========")
+            self.use_disc = True
+            self.optimizer_disc = optimizer(self.model.disc)
+            self.optimizer_z_encoder = None
+        elif opt.embedding_net == "bicyclegan":
+            assert(hasattr(self.model, "disc"))
+            assert(hasattr(self.model, "z_encoder"))
+            self.use_disc = True
+            self.optimizer_disc = optimizer(self.model.disc)
+            self.optimizer_z_encoder = optimizer(self.model.z_encoder)
+        else:
+            print(f"========= No discriminator. =========")
+            self.use_disc = False
+            self.optimizer_disc = None
+            self.optimizer_z_encoder = None
 
         if lr_scheduler is None:
             self.lr_scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda epoch: 1) # fake scheduler
+            self.lr_scheduler_disc = None
+            self.lr_scheduler_z_encoder = None
         else:
             self.lr_scheduler = lr_scheduler(self.optimizer)
+            self.lr_scheduler_disc = lr_scheduler(self.optimizer_disc) if self.optimizer_disc else None
+            self.lr_scheduler_z_encoder = lr_scheduler(self.optimizer_z_encoder) if self.optimizer_z_encoder else None
 
         if ema_decay is not None:
             self.ema = ExponentialMovingAverage(self.model.parameters(), decay=ema_decay)
@@ -426,7 +450,7 @@ class Trainer(object):
 
     ### ------------------------------	
 
-    def train_step(self, data):
+    def train_step(self, data):  # generation forward
 
         rays_o = data['rays_o'] # [B, N, 3]
         rays_d = data['rays_d'] # [B, N, 3]
@@ -449,10 +473,13 @@ class Trainer(object):
             #     'pts_masks': data['pts_masks'],
             #     'pts_rgbs': data['pts_rgbs'],
             # }
+            self.model.encoder.posterior = None
             self.model.encoder.embeddings = None
             self.model.encoder.density = {}
             self.model.set_raymarching_density()
             # self.model.encoder.count = 0
+            self.model.encoder.z_mu = None
+            self.model.encoder.z_logvar = None
 
         # if there is no gt image, we train with CLIP loss.
         if 'images' not in data:
@@ -491,31 +518,38 @@ class Trainer(object):
         else:
             gt_rgb = images
 
+        if hasattr(self.model, 'z_encoder'):
+            # G (self.model.encoder) will use the latent (mu, logvar) afterwards (in grid.py)
+            self.model.encoder.z_mu, self.model.encoder.z_logvar = self.model.z_encoder(gt_rgb)
+            loss['kl'] = 0.5 * torch.sum(torch.exp(self.model.encoder.z_logvar) + self.model.encoder.z_mu ** 2 - self.model.encoder.z_logvar - 1)
+
         outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, **vars(self.opt))
         # outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=True, **vars(self.opt))
     
         pred_rgb = outputs['image']
 
         # MSE loss
-        loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [B, N, 3] --> [B, N]
+        loss = {}
+        loss["rgb"] = self.criterion(pred_rgb, gt_rgb).mean(-1) # [B, N, 3] --> [B, N]
+        if hasattr(self.model.encoder, "emb_mus"):
+            raise NotImplementedError
+            assert(hasattr(self.model.encoder, "emb_vars"))
+            for mu, var in zip(self.model.encoder.emb_mus, self.model.encoder.emb_vars):
+                loss += 0.5 * torch.mean(mu.pow(2) + var - torch.log(var) - 1.0)
 
         if 'depths' in data:
             assert('depth_bound_scale' in outputs)
-            gt_dep = data['depths'][..., 0] / 32 # [B, N, (1)]
+            # aabb_size: 128m, front 64m back 64m left 64m right 64m
+            # bound: default 2
+            meter_per_bound_scale = self.model.encoder.aabb_size / (self.model.bound * 2)
+            gt_dep = data['depths'][..., 0] / meter_per_bound_scale # [B, N, (1)]
             pred_dep = outputs['depth_bound_scale'] # [B, N]
-            # gt_dep / pred_dep == 32?
-            # print(gt_dep.shape, gt_dep.min(), gt_dep.max())
-            # print(pred_dep.shape, pred_dep.min(), pred_dep.max())
-            # for a, b in zip(gt_dep[0, :, 0], pred_dep[0]):
-            #     if a > 0 and b > 0:
-            #         print(a, b, a / b)
-            #         input()
-            mask = (0 < gt_dep) & (gt_dep < 2) & (0 < pred_dep) & (pred_dep < 2)
-            if mask.float().mean() > 0:
-                loss += torch.abs(gt_dep[mask] - pred_dep[mask]).mean()
-        else:
-            assert(False)
-
+            mask = (self.model.min_near <= gt_dep) & (gt_dep <= self.model.bound)
+            loss["dep"] = torch.abs(gt_dep - pred_dep) * mask.float()
+        
+        if hasattr(self.model.encoder, "posterior"):
+            if self.model.encoder.posterior is not None:
+                loss["kl"] = self.model.encoder.posterior.kl().mean()
 
         # patch-based rendering
         if self.opt.patch_size > 1:
@@ -526,10 +560,11 @@ class Trainer(object):
             # torch_vis_2d(pred_rgb[0])
 
             # LPIPS loss [not useful...]
-            loss = loss + 1e-3 * self.criterion_lpips(pred_rgb, gt_rgb)
+            loss["lpips"] = 1e-3 * self.criterion_lpips(pred_rgb, gt_rgb)
 
         # special case for CCNeRF's rank-residual training
-        if len(loss.shape) == 3: # [K, B, N]
+        if len(loss["rgb"].shape) == 3: # [K, B, N]
+            raise NotImplementedError
             loss = loss.mean(0)
 
         # update error_map
@@ -556,7 +591,7 @@ class Trainer(object):
             # put back
             self.error_map[index] = error_map
 
-        loss = loss.mean()
+        # loss = loss.mean()
 
         # extra loss
         # pred_weights_sum = outputs['weights_sum'] + 1e-8
@@ -583,6 +618,8 @@ class Trainer(object):
             self.model.encoder.density = {}
             self.model.set_raymarching_density()
             # self.model.encoder.count = 0
+            self.model.encoder.z_mu = None
+            self.model.encoder.z_logvar = None
 
         if self.opt.color_space == 'linear':
             images[..., :3] = srgb_to_linear(images[..., :3])
@@ -600,6 +637,10 @@ class Trainer(object):
         pred_depth = outputs['depth'].reshape(B, H, W)
 
         loss = self.criterion(pred_rgb, gt_rgb).mean()
+        if hasattr(self.model.encoder, "emb_mus"):
+            assert(hasattr(self.model.encoder, "emb_vars"))
+            for mu, var in zip(self.model.encoder.emb_mus, self.model.encoder.emb_vars):
+                loss += 0.5 * torch.mean(mu.pow(2) + var - torch.log(var) - 1.0)
 
         return pred_rgb, pred_depth, gt_rgb, loss
 
@@ -618,9 +659,12 @@ class Trainer(object):
             assert(hasattr(self.model.encoder, 'embeddings'))
             self.model.encoder.pts_data = data
             self.model.encoder.embeddings = None
+            # if data["test_index"] == 0:
             self.model.encoder.density = {}
             self.model.set_raymarching_density()
             # self.model.encoder.count = 0
+            self.model.encoder.z_mu = None
+            self.model.encoder.z_logvar = None
 
         if bg_color is not None:
             bg_color = bg_color.to(self.device)
@@ -710,7 +754,7 @@ class Trainer(object):
         with torch.no_grad():
 
             for i, data in enumerate(loader):
-                
+                data["test_index"] = i
                 with torch.cuda.amp.autocast(enabled=self.fp16):
                     preds, preds_depth = self.test_step(data)
 
@@ -857,7 +901,9 @@ class Trainer(object):
     def train_one_epoch(self, loader):
         self.log(f"==> Start Training Epoch {self.epoch}, lr={self.optimizer.param_groups[0]['lr']:.6f} ...")
 
-        total_loss = 0
+        total_pixel_loss = 0
+        if self.use_disc:
+            total_g_loss, total_d_loss = 0, 0
         if self.local_rank == 0 and self.report_metric_at_train:
             for metric in self.metrics:
                 metric.clear()
@@ -885,40 +931,112 @@ class Trainer(object):
             self.global_step += 1
 
             self.optimizer.zero_grad()
+            if hasattr(self.model, 'z_encoder'):
+                self.optimizer_z_encoder.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
-         
+                preds, truths, loss_dict = self.train_step(data)
+            # TODO: "lpips"
+            color_loss = loss_dict["rgb"].mean()
+            depth_loss = loss_dict["dep"].mean()
+            pixel_loss = self.opt.color_loss_weight * color_loss + \
+                            self.opt.depth_loss_weight * depth_loss
+            if "kl" in loss_dict:   # for bicyclegan & minkvae
+                kl_loss = loss_dict["kl"]
+                pixel_loss += self.opt.kl_loss_weight * kl_loss
+
+            loss = pixel_loss
+            if self.use_disc:
+                #BxP**2x3 -> Bx3xHxW
+                pred_imgs = preds.reshape(preds.shape[0], self.opt.patch_size, self.opt.patch_size, 3).permute(0,3,1,2).contiguous()
+                gt_imgs = truths.reshape(truths.shape[0], self.opt.patch_size, self.opt.patch_size, 3).permute(0,3,1,2).contiguous()
+
+                valid_logits = self.model.disc(pred_imgs)
+                g_loss = F.softplus(-valid_logits).mean()  # -log(sigmoid(valid_logits))
+                loss += g_loss
+        
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
+            if hasattr(self.model, 'z_encoder'):
+                self.scaler.step(self.optimizer_z_encoder)
             self.scaler.update()
+
+
+            if self.use_disc:
+                self.optimizer_disc.zero_grad()
+
+                valid_fake_logits = self.model.disc(pred_imgs.detach())
+                d_fake_loss = F.softplus(valid_fake_logits).mean() # -log(1 - sigmoid(valid_fake_logits))
+                # d_fake_loss = self.model.disc.compute_loss(pred_imgs.detach(), 0)   # fake
+                # d_fake_loss = F.relu(1.0 + self.model.disc(pred_imgs.detach())).mean()
+
+                gt_imgs_tmp = gt_imgs.detach().requires_grad_(self.opt.r1_gamma > 0)
+                valid_real_logits = self.model.disc(gt_imgs_tmp)
+                d_real_loss = F.softplus(-valid_real_logits).mean()    # -log(sigmoid(valid_real_logits))
+                # d_real_loss = self.model.disc.compute_loss(gt_imgs.detach(), 1)  # valid
+                # d_real_loss = F.relu(1.0 - self.model.disc(gt_imgs.detach())).mean()
+
+                d_loss = (d_fake_loss + d_real_loss) / 2
+                # d_loss = 0.1 * d_loss
+
+                if self.opt.r1_gamma > 0:
+                    r1_grads = torch.autograd.grad(outputs=[valid_real_logits.sum()], 
+                                    inputs=[gt_imgs_tmp], 
+                                    create_graph=True, only_inputs=True)[0] # Nx3x128x128
+                    r1_penalty = r1_grads.square().sum([1,2,3])
+                    d_r1_loss = (self.opt.r1_gamma / 2) * r1_penalty.mean()
+                    d_loss += d_r1_loss
+
+                self.scaler.scale(d_loss).backward()
+                self.scaler.step(self.optimizer_disc)
+                self.scaler.update()
 
             if self.scheduler_update_every_step:
                 self.lr_scheduler.step()
+                if self.use_disc:
+                    self.lr_scheduler_disc.step()
+                if hasattr(self.model, 'z_encoder'):
+                    self.lr_scheduler_z_encoder.step()
 
-            loss_val = loss.item()
-            total_loss += loss_val
+            # del loss_dict
+
+            pixel_loss_val = pixel_loss.detach().item()
+            total_pixel_loss += pixel_loss_val
+            if self.use_disc:
+                g_loss_val, d_loss_val = g_loss.detach().item(), d_loss.detach().item()
+                total_g_loss += g_loss_val
+                total_d_loss += d_loss_val
 
             if self.local_rank == 0:
                 if self.report_metric_at_train:
                     for metric in self.metrics:
                         metric.update(preds, truths)
-                        
+                
+                # TODO: separately saving different loss terms
                 if self.use_tensorboardX:
-                    self.writer.add_scalar("train/loss", loss_val, self.global_step)
+                    self.writer.add_scalar("train/pixel_loss", pixel_loss_val, self.global_step)
                     self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]['lr'], self.global_step)
+                    if self.use_disc:
+                        self.writer.add_scalar("train/g_loss", g_loss_val, self.global_step)
+                        self.writer.add_scalar("train/d_loss", d_loss_val, self.global_step)
 
-                if self.scheduler_update_every_step:
-                    pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}")
+                if self.use_disc:
+                    # if self.scheduler_update_every_step:
+                    pbar.set_description(f"pixel_loss={pixel_loss_val:.4f} ({total_pixel_loss/self.local_step:.4f}), g_loss={g_loss_val:.4f} ({total_g_loss/self.local_step:.4f}), d_loss={d_loss_val:.4f} ({total_d_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}")
+                    # else:
+                    #     pbar.set_description(f"pixel_loss={pixel_loss_val:.4f} ({total_pixel_loss/self.local_step:.4f}), g_loss={g_loss_val:.4f} ({total_g_loss/self.local_step:.4f}), d_loss={d_loss_val:.4f} ({total_d_loss/self.local_step:.4f})")
                 else:
-                    pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
+                    # if self.scheduler_update_every_step:
+                    pbar.set_description(f"loss={pixel_loss_val:.4f} ({total_pixel_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}")
+                    # else:
+                    #     pbar.set_description(f"loss={pixel_loss_val:.4f} ({total_pixel_loss/self.local_step:.4f})")
                 pbar.update(loader.batch_size)
 
         if self.ema is not None:
             self.ema.update()
 
-        average_loss = total_loss / self.local_step
-        self.stats["loss"].append(average_loss)
+        avg_pixel_loss = total_pixel_loss / self.local_step
+        self.stats["loss"].append(avg_pixel_loss)
 
         if self.local_rank == 0:
             pbar.close()
@@ -931,7 +1049,7 @@ class Trainer(object):
 
         if not self.scheduler_update_every_step:
             if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                self.lr_scheduler.step(average_loss)
+                self.lr_scheduler.step(avg_pixel_loss)
             else:
                 self.lr_scheduler.step()
 
@@ -1148,12 +1266,26 @@ class Trainer(object):
             except:
                 self.log("[WARN] Failed to load optimizer.")
         
+        if self.optimizer_disc and 'optimizer_disc' in checkpoint_dict:
+            try:
+                self.optimizer_disc.load_state_dict(checkpoint_dict['optimizer_disc'])
+                self.log("[INFO] loaded optimizer disc.")
+            except:
+                self.log("[WARN] Failed to load optimizer disc.")
+        
         if self.lr_scheduler and 'lr_scheduler' in checkpoint_dict:
             try:
                 self.lr_scheduler.load_state_dict(checkpoint_dict['lr_scheduler'])
                 self.log("[INFO] loaded scheduler.")
             except:
                 self.log("[WARN] Failed to load scheduler.")
+        
+        if self.lr_scheduler_disc and 'lr_scheduler_disc' in checkpoint_dict:
+            try:
+                self.lr_scheduler_disc.load_state_dict(checkpoint_dict['lr_scheduler_disc'])
+                self.log("[INFO] loaded scheduler disc.")
+            except:
+                self.log("[WARN] Failed to load scheduler disc.")
         
         if self.scaler and 'scaler' in checkpoint_dict:
             try:
