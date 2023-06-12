@@ -496,3 +496,35 @@ class MinkVAE(nn.Module):
             z = posterior.mode()
         dec = self.decode(z)
         return tuple(dec), posterior
+
+
+from taming.modules.vqvae.quantize import VectorQuantizer2 as VectorQuantizer
+
+class MinkVQVAE(nn.Module):
+
+    def __init__(self, in_channels, z_channels, num_emb, gaussian_channels, emb_channels):
+        super().__init__()
+        self.encoder = MinkFieldEncoder(in_channels, z_channels)
+        self.enc_quant_conv = ME.MinkowskiConvolution(z_channels, gaussian_channels, kernel_size=1, dimension=3)
+        self.quantize = VectorQuantizer(num_emb, gaussian_channels, beta=0.25,
+                                        remap=None,#remap,
+                                        sane_index_shape=True)
+        self.dec_quant_conv = ME.MinkowskiConvolution(gaussian_channels, z_channels, kernel_size=1, dimension=3)
+        self.decoder = MinkDecoder(z_channels, emb_channels)
+
+    def encode(self, x):
+        h = self.encoder(x)
+        moments = self.enc_quant_conv(h)
+        mF = moments.F.transpose(0, 1)[None, ..., None] # 1, C, N, 1
+        quant, emb_loss, info = self.quantize(mF)
+        quant = set_feature(moments, quant[0, ..., 0].transpose(0, 1))
+        return quant, emb_loss, info
+
+    def decode(self, z):
+        z = self.dec_quant_conv(z)
+        return self.decoder(z)
+
+    def forward(self, x):
+        quant, diff, (_, _, ind) = self.encode(x)
+        dec = self.decode(quant)
+        return dec, diff, ind

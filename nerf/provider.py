@@ -233,10 +233,14 @@ class NeRFDataset:
                 if type == 'train':
                     if opt.dataset_scale == 'tiny':
                         frames = frames[30:31]
+                    elif opt.dataset_scale == 'resampletiny':
+                        frames = frames[0:8]
                     elif opt.dataset_scale == 'small':
                         frames = frames[:80]
                     elif opt.dataset_scale == 'full':
-                        frames = frames[:1520]
+                        frames = frames[:1860]
+                    elif opt.dataset_scale.startswith('resample'):
+                        frames = frames[:1550]
                     else:
                         # raise Exception(f'Do not support given dataset_scale arg: {opt.dataset_scale}')
                         a, b = opt.dataset_scale.split(",")
@@ -244,10 +248,14 @@ class NeRFDataset:
                 elif type == 'val':
                     if opt.dataset_scale == 'tiny':
                         frames = frames[30:31]
+                    elif opt.dataset_scale == 'resampletiny':
+                        frames = frames[0:16]
                     elif opt.dataset_scale == 'small':
                         frames = frames[0:60:10] + frames[1525:1566:10]
                     elif opt.dataset_scale == 'full':
-                        frames = frames[0:50:10] + frames[1520:1600]
+                        frames = frames[1860:] + frames[60:1860:100]
+                    elif opt.dataset_scale.startswith('resample'):
+                        frames = frames[0:80:8] + frames[1550:]
                     else:
                         # raise Exception(f'Do not support given dataset_scale arg: {opt.dataset_scale}')
                         a, b = opt.dataset_scale.split(",")
@@ -269,6 +277,22 @@ class NeRFDataset:
                         n_poses += 1
                         frames = [frames[1520-1+i] for i in [10,20,34,50,65]]#[10]*n_poses+[20]*n_poses+[34]*n_poses+[50]*n_poses+[65]*n_poses]
                         # frames = [frames[i] for i in [0, 78, 79, 80, 81, 82]]#+[79]*n_poses+[80]*n_poses+[81]*n_poses+[82]*n_poses]
+                    elif opt.dataset_scale.startswith("resample"):
+                        targets = [opt.dataset_scale.replace("resample_", "")]
+                        temp_frames = []
+                        # "0cm3FmEopleXtLauJaJ8ng"
+                        # "1AF3wXsMQbL1Nb-ZxHrSDQ"
+                        # "1RABiy3kVucrVKftff4oEg"
+                        # "1mKXDGKTuJmnsWU_AQiv4Q"
+                        for frame in frames:
+                            for target in targets:
+                                if target in frame["file_path"]:
+                                    temp_frames.append(frame)
+                        frames = temp_frames
+                        n_poses = 24
+                        circle_poses = [np.eye(4).astype(np.float32)]
+                        circle_poses.extend(get_circle_poses(0.04, 8.0, n_poses)) # local_circle to camera
+                        n_poses += 1
                     else:
                         n_poses = 12
                         circle_poses = [np.eye(4).astype(np.float32)]
@@ -279,11 +303,12 @@ class NeRFDataset:
                         # frames = frames[1520:1600]
                         # frames = frames[:80]
                         # frames = [frames[i] for i in [1]*11+[9]*11+[17]*11+[25]*11+[33]*11]
-                        # frames = [frames[1520-1+i] for i in [10,20,34,50,65]]
-                    
-            
+                        # frames = [frames[1520-1+i] for i in [10,20,34,50,65]]  
+
+            self.org_poses = []
             self.poses = []
             self.images = []
+            self.frames = frames
             for f in tqdm.tqdm(frames, desc=f'Loading {type} data'):
                 f_path = os.path.join(self.root_path, f['file_path'])
                 if self.mode == 'blender' and '.' not in os.path.basename(f_path):
@@ -294,16 +319,7 @@ class NeRFDataset:
                     continue
                 
                 pose = np.array(f['transform_matrix'], dtype=np.float32) # [4, 4]
-
-                # if opt.random_z_rotate:
-                #     rand_theta = np.random.rand() * 2 * np.pi
-                #     pose = np.array([
-                #         [np.cos(rand_theta), -np.sin(rand_theta), 0, 0],
-                #         [np.sin(rand_theta), np.cos(rand_theta), 0, 0],
-                #         [0, 0, 1, 0],
-                #         [0, 0, 0, 1],
-                #     ]).astype(np.float32) @ pose
-    
+                self.org_poses.append(pose)
                 pose = nerf_matrix_to_ngp(pose, scale=self.scale, offset=self.offset)
 
                 image = cv2.imread(f_path, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
@@ -350,21 +366,22 @@ class NeRFDataset:
                 if type == 'test':
                     self.images += [image] * (n_poses - 1)
         
-        # if type == 'test':
-        #     for i in range(0, len(self.poses), n_poses):
-        #         # interp between self.poses[i], self.poses[i+n_poses]
-        #         j = (i + n_poses) % len(self.poses)
-        #         rots = Rotation.from_matrix(np.stack([self.poses[i][:3, :3], self.poses[j][:3, :3]]))
-        #         slerp = Slerp([0, 1], rots)
-        #         for k in range(1, n_poses):
-        #             ratio = np.sin((k / n_poses - 0.5) * np.pi) * 0.5 + 0.5
-        #             pose = np.eye(4, dtype=np.float32)
-        #             pose[:3, :3] = slerp(ratio).as_matrix()
-        #             pose[:3, 3] = (1 - ratio) * self.poses[i][:3, 3] + ratio * self.poses[j][:3, 3]
-        #             self.poses[i + k] = pose
-        #     # self.poses = self.poses[::n_poses] + self.poses
-        #     # self.depths = self.depths[::n_poses] + self.depths
-        #     # self.images = self.images[::n_poses] + self.images
+        if type == 'test' and opt.dataset_scale.startswith('resample'):
+            for i in range(0, len(self.poses), n_poses):
+                # interp between self.poses[i], self.poses[i+n_poses]
+                j = (i + n_poses) % len(self.poses)
+                rots = Rotation.from_matrix(np.stack([self.poses[i][:3, :3], self.poses[j][:3, :3]]))
+                slerp = Slerp([0, 1], rots)
+                for k in range(1, n_poses):
+                    ratio = np.sin((k / n_poses - 0.5) * np.pi) * 0.5 + 0.5
+                    pose = np.eye(4, dtype=np.float32)
+                    pose[:3, :3] = slerp(ratio).as_matrix()
+                    pose[:3, 3] = (1 - ratio) * self.poses[i][:3, 3] + ratio * self.poses[j][:3, 3]
+                    self.poses[i + k] = pose
+            self.frames *= 200
+            # self.poses = self.poses[::n_poses] + self.poses
+            # self.depths = self.depths[::n_poses] + self.depths
+            # self.images = self.images[::n_poses] + self.images
             
         self.poses = torch.from_numpy(np.stack(self.poses, axis=0)) # [N, 4, 4]
         if self.images is not None:
@@ -445,6 +462,33 @@ class NeRFDataset:
 
         poses = self.poses[index].to(self.device) # [B, 4, 4]
 
+        if self.opt.random_z_rotate:
+
+            left_mat_nerf2ngp = torch.eye(4)[[1, 2, 0, 3]].to(poses.device)
+            right_mat_nerf2ngp = torch.diag(torch.Tensor([1, -1, -1, 1])).to(poses.device)
+            inv_left = torch.linalg.inv(left_mat_nerf2ngp)
+            inv_right = torch.linalg.inv(right_mat_nerf2ngp)
+
+            org_poses = torch.matmul(inv_left, torch.matmul(poses, inv_right))
+
+            # print(org_poses[0])
+            # print(self.org_poses[index[0]])
+            # input()
+            # if self.opt.random_z_rotate:
+            #     pose = self.rand_z_pose.dot(pose)
+
+            rand_theta = torch.rand([]) * 2 * np.pi
+            rand_z_pose = torch.Tensor([
+                [torch.cos(rand_theta), -torch.sin(rand_theta), 0, 0],
+                [torch.sin(rand_theta), torch.cos(rand_theta), 0, 0],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1],
+            ]).to(poses.device)
+
+            org_poses = torch.matmul(rand_z_pose, org_poses)
+            poses = torch.matmul(left_mat_nerf2ngp, torch.matmul(org_poses, right_mat_nerf2ngp))
+
+
         error_map = None if self.error_map is None else self.error_map[index]
         
         rays = get_rays(poses, self.intrinsics, self.H, self.W, self.num_rays, error_map, self.opt.patch_size)
@@ -464,19 +508,39 @@ class NeRFDataset:
             results['images'] = images
         
         if self.depths is not None:
-            images = self.images[index].to(self.device) # [B, H, W, 3/4]
-            depths = self.depths[index].to(self.device) # [B, H, W, 1]
-            masks = (self.z_near < depths[..., 0]) & (depths[..., 0] < self.z_far) # [B, H, W]
-            coords = deps_to_camera_coord(depths, self.intrinsics) # [B, H, W, 3]
+            
+            if "pc_path" not in self.frames[index[0]]:
+                images = self.images[index].to(self.device) # [B, H, W, 3/4]
+                depths = self.depths[index].to(self.device) # [B, H, W, 1]
+                masks = (self.z_near < depths[..., 0]) & (depths[..., 0] < self.z_far) # [B, H, W]
+                coords = deps_to_camera_coord(depths, self.intrinsics) # [B, H, W, 3]
 
-            results['pts_batch'] = torch.arange(B).to(self.device).repeat(self.H, self.W, 1).permute([2, 0, 1])
-            results['pts_coords'] = torch.matmul(
-                coords.view(B, self.H * self.W, 3),
-                poses[:, :3, :3].transpose(1, 2),
-            ).view(B, self.H, self.W, 3)
-            results['pts_coords'] = results['pts_coords'][..., [2, 0, 1]]
-            results['pts_masks'] = masks
-            results['pts_rgbs'] = images
+                results['pts_batch'] = torch.arange(B).to(self.device).repeat(self.H, self.W, 1).permute([2, 0, 1])
+                results['pts_coords'] = torch.matmul(
+                    coords.view(B, self.H * self.W, 3),
+                    poses[:, :3, :3].transpose(1, 2),
+                ).view(B, self.H, self.W, 3)
+                results['pts_coords'] = results['pts_coords'][..., [2, 0, 1]]
+                results['pts_masks'] = masks
+                results['pts_rgbs'] = images
+            
+            else:
+                depths = self.depths[index].to(self.device) # [B, H, W, 1]
+
+                pc_path = os.path.join(self.root_path, self.frames[index[0]]["pc_path"])
+                pc_dict = np.load(pc_path)
+                num_points = pc_dict["coord"].shape[0]
+                results['pts_batch'] = torch.zeros(num_points).to(self.device).float()
+                results['pts_coords'] = torch.from_numpy(
+                    pc_dict["coord"]#.dot(self.rand_z_pose[:3, :3].T)
+                ).to(self.device).float()
+                results['pts_masks'] = torch.ones(num_points).to(self.device).bool()
+                results['pts_rgbs'] = torch.from_numpy(pc_dict["color"]).to(self.device).float() / 255.0
+                if "normal" in pc_dict:
+                    results['pts_normal'] = torch.from_numpy(pc_dict["normal"]).to(self.device).float()
+
+                if self.opt.random_z_rotate:
+                    results['pts_coords'] = torch.matmul(results['pts_coords'], rand_z_pose[:3, :3].transpose(0, 1))
 
             # with open(f'vis/{index[0]:04d}.txt', 'w') as f:
             #     for (x, y, z), (r, g, b) in zip(
@@ -503,9 +567,9 @@ class NeRFDataset:
         size = len(self.poses)
         if self.training and self.rand_pose > 0:
             size += size // self.rand_pose # index >= size means we use random pose.
-        loader = DataLoader(list(range(size)), batch_size=1, collate_fn=self.collate, shuffle=self.training, num_workers=0)
+        loader = DataLoader(list(range(size)), batch_size=1, collate_fn=self.collate, shuffle=False, num_workers=0)
         loader._data = self # an ugly fix... we need to access error_map & poses in trainer.
-        loader.has_gt = self.images is not None
+        loader.has_gt = self.images is not None#self.training
         return loader
     
     def dataloader_my(self, batch_size):

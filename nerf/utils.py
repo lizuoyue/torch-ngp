@@ -518,6 +518,8 @@ class Trainer(object):
         else:
             gt_rgb = images
 
+        loss = {}
+        
         if hasattr(self.model, 'z_encoder'):
             # G (self.model.encoder) will use the latent (mu, logvar) afterwards (in grid.py)
             self.model.encoder.z_mu, self.model.encoder.z_logvar = self.model.z_encoder(gt_rgb)
@@ -529,8 +531,11 @@ class Trainer(object):
         pred_rgb = outputs['image']
 
         # MSE loss
-        loss = {}
         loss["rgb"] = self.criterion(pred_rgb, gt_rgb).mean(-1) # [B, N, 3] --> [B, N]
+        if self.opt.use_image_weight:
+            valid_pixels = (gt_rgb > 0).all(dim=-1) # shape [B, N]
+            loss["rgb"] = loss["rgb"][valid_pixels]
+
         if hasattr(self.model.encoder, "emb_mus"):
             raise NotImplementedError
             assert(hasattr(self.model.encoder, "emb_vars"))
@@ -547,9 +552,12 @@ class Trainer(object):
             mask = (self.model.min_near <= gt_dep) & (gt_dep <= self.model.bound)
             loss["dep"] = torch.abs(gt_dep - pred_dep) * mask.float()
         
-        if hasattr(self.model.encoder, "posterior"):
-            if self.model.encoder.posterior is not None:
-                loss["kl"] = self.model.encoder.posterior.kl().mean()
+        if hasattr(self.model.encoder, "posterior") and self.model.encoder.posterior is not None:
+            loss["vae"] = self.model.encoder.posterior.kl().mean()
+        
+        if hasattr(self.model.encoder, "vqloss") and self.model.encoder.vqloss is not None:
+            print("vae_loss", self.model.encoder.vqloss)
+            loss["vae"] = self.model.encoder.vqloss
 
         # patch-based rendering
         if self.opt.patch_size > 1:
@@ -658,7 +666,7 @@ class Trainer(object):
             assert(hasattr(self.model.encoder, 'pts_data'))
             assert(hasattr(self.model.encoder, 'embeddings'))
             self.model.encoder.pts_data = data
-            self.model.encoder.embeddings = None
+            # self.model.encoder.embeddings = None
             # if data["test_index"] == 0:
             self.model.encoder.density = {}
             self.model.set_raymarching_density()
@@ -739,6 +747,9 @@ class Trainer(object):
 
         if name is None:
             name = f'{self.name}_ep{self.epoch:04d}'
+        
+        if self.opt.feed_pc is not None:
+            name += ("_" + os.path.basename(self.opt.feed_pc)[:-4])
 
         os.makedirs(save_path, exist_ok=True)
         
@@ -941,9 +952,14 @@ class Trainer(object):
             depth_loss = loss_dict["dep"].mean()
             pixel_loss = self.opt.color_loss_weight * color_loss + \
                             self.opt.depth_loss_weight * depth_loss
-            if "kl" in loss_dict:   # for bicyclegan & minkvae
-                kl_loss = loss_dict["kl"]
-                pixel_loss += self.opt.kl_loss_weight * kl_loss
+            # if "kl" in loss_dict:   # for bicyclegan & minkvae
+            #     kl_loss = loss_dict["kl"]
+            #     pixel_loss += self.opt.kl_loss_weight * kl_loss
+            
+            if "vae" in loss_dict: # for minkvae
+                vae_loss = loss_dict["vae"]
+                print("vae_loss", vae_loss)
+                pixel_loss += self.opt.vae_loss_weight * vae_loss
 
             loss = pixel_loss
             if self.use_disc:
@@ -1156,7 +1172,7 @@ class Trainer(object):
 
         self.log(f"++> Evaluate epoch {self.epoch} Finished.")
 
-    def save_checkpoint(self, name=None, full=False, best=False, remove_old=True):
+    def save_checkpoint(self, name=None, full=False, best=False, remove_old=False):
 
         if name is None:
             name = f'{self.name}_ep{self.epoch:04d}'

@@ -24,6 +24,11 @@ class NeRFNetwork(NeRFRenderer):
                  hidden_dim_bg=64,
                  bound=1,
                  activation='relu',
+                 level_dim=8,
+                 z_dim=128,
+                 initseed_dim=8,
+                 num_gan_blocks=5,
+                 opt=None,
                  **kwargs,
                  ):
         super().__init__(bound, **kwargs)
@@ -45,14 +50,15 @@ class NeRFNetwork(NeRFRenderer):
 
         self.encoder, self.in_dim = get_encoder(encoding,   # is 'hashgrid_minkowski_hierarchical' defaultly
             embeding_net=embedding_net, embedding_regu=embedding_regu,
-            num_levels=4, level_dim=8, base_resolution=256,
-            desired_resolution=2048, align_corners=False, pts_scale=pts_scale)
+            num_levels=4, level_dim=level_dim, z_dim=z_dim, base_resolution=256,
+            initseed_dim=initseed_dim, num_gan_blocks=num_gan_blocks,
+            desired_resolution=2048, align_corners=False, pts_scale=pts_scale, opt=opt)
         
         if embedding_net == "stylegan":
             self.disc = get_disc()
         elif embedding_net == 'bicyclegan':
             self.disc = get_disc()
-            self.z_encoder = get_z_encoder()
+            self.z_encoder = get_z_encoder(z_dim=z_dim)
 
         sigma_net = []
         for l in range(num_layers):
@@ -73,12 +79,19 @@ class NeRFNetwork(NeRFRenderer):
         # color network
         self.num_layers_color = num_layers_color        
         self.hidden_dim_color = hidden_dim_color
-        self.encoder_dir, self.in_dim_dir = get_encoder(encoding_dir)
+
+        self.opt = opt
+        if self.opt.disable_direction:
+            self.encoder_dir, self.in_dim_dir = get_encoder("frequency", input_dim=3)
+        else: # default
+            self.encoder_dir, self.in_dim_dir = get_encoder(encoding_dir)
         
         color_net =  []
         for l in range(num_layers_color):
             if l == 0:
                 in_dim = self.in_dim_dir + self.geo_feat_dim
+                if self.opt.disable_direction:
+                    in_dim += self.in_dim
             else:
                 in_dim = hidden_dim_color
             
@@ -121,9 +134,9 @@ class NeRFNetwork(NeRFRenderer):
         # d: [N, 3], nomalized in [-1, 1]
 
         # sigma
-        x = self.encoder(x, bound=self.bound)
+        x_ft = self.encoder(x, bound=self.bound)
 
-        h = x
+        h = x_ft
         for l in range(self.num_layers):
             h = self.sigma_net[l](h)
             if l != self.num_layers - 1:
@@ -133,11 +146,22 @@ class NeRFNetwork(NeRFRenderer):
                     h = F.leaky_relu(h, negative_slope=0.2, inplace=True)
 
         #sigma = F.relu(h[..., 0])
-        sigma = trunc_exp(h[..., 0])
+        if self.opt.sigma_softplus:
+            sigma = F.softplus(h[..., 0])
+        else:
+            sigma = trunc_exp(h[..., 0])
+        
         geo_feat = h[..., 1:]
 
         # color
-        d = self.encoder_dir(d)
+        if self.opt.disable_direction:
+            coord = x / self.bound / 2.0 * self.encoder.aabb_size * self.encoder.scale
+            coord -= torch.floor(coord) # only digital part
+            d = self.encoder_dir(coord)
+            d = torch.cat([d, x_ft], dim=-1)
+        else: # default
+            d = self.encoder_dir(d)
+
         h = torch.cat([d, geo_feat], dim=-1)
         for l in range(self.num_layers_color):
             h = self.color_net[l](h)
@@ -154,7 +178,7 @@ class NeRFNetwork(NeRFRenderer):
 
     def density(self, x):
         # x: [N, 3], in [-bound, bound]
-
+        assert(False) # Not used
         x = self.encoder(x, bound=self.bound)
         h = x
         for l in range(self.num_layers):

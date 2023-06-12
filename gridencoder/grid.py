@@ -10,11 +10,13 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 import MinkowskiEngine as ME
 from .resfieldnet import ResFieldNet50Hierarchical
 from .resfieldnet import ResNet50
-from .minkvae import MinkVAE
-from .minkfieldunet import MinkFieldUNet50Small, MinkFieldUNet14A
+from .minkvae import MinkVAE, MinkVQVAE
+from .minkfieldunet import MinkFieldUNet50Small, MinkFieldUNet14A, MinkFieldUNet34A
 from .style_unet import StyleFieldUNet50Small, StyleFieldUNet14A
 # from .stylegan2_3d import StyleGAN2_3D_Generator
 from .stylegan1_3d import StyleGAN2_3D_Generator
+import matplotlib; matplotlib.use("agg")
+import matplotlib.pyplot as plt
 
 try:
     import _gridencoder as _backend
@@ -303,9 +305,10 @@ class GridEncoderMinkowski(nn.Module):
 
 
 class GridEncoderMinkowskiHierarchical(nn.Module):
-    def __init__(self, input_dim=3, num_levels=16, level_dim=2, per_level_scale=2, base_resolution=16,
+    def __init__(self, input_dim=3, num_levels=16, level_dim=2, z_dim=128, 
+                initseed_dim=8, num_gan_blocks=5, per_level_scale=2, base_resolution=16,
                 log2_hashmap_size=19, desired_resolution=None, gridtype='hash', align_corners=False, 
-                embedding_net='unet', embedding_regu='none', scale=20):
+                embedding_net='unet', embedding_regu='none', scale=20, opt=None):
         super().__init__()
 
         # the finest resolution desired at the last level, if provided, overridee per_level_scale
@@ -326,7 +329,7 @@ class GridEncoderMinkowskiHierarchical(nn.Module):
         self.embedding_net = embedding_net
         self.embedding_regu = embedding_regu
 
-        self.aabb_size = 128 # meter, front 64m back 64m left 64m right 64m
+        self.aabb_size = opt.aabb_size # meter, front 32m back 32m left 32m right 32m
         # self.scale = 80
         # for voxel sizes 0.1, 0.2, 0.4, and 0.8
         # originally 1/80, become 1/10 after 3 downsamples
@@ -336,6 +339,8 @@ class GridEncoderMinkowskiHierarchical(nn.Module):
         # self.scale = 240
         # for voxel sizes
         # originally 1/240, become 1/30 after 3 downsamples
+
+        
         
         if self.dual:
             self.net = ResFieldNet50Hierarchical(3, 4)
@@ -343,41 +348,63 @@ class GridEncoderMinkowskiHierarchical(nn.Module):
             self.scale_dual = self.scale * np.sqrt(2)
             # self.output_dim *= 2
         else:
+
+            self.aggregation = "concat"
+            if "_" in self.embedding_net:
+                self.embedding_net, self.aggregation = self.embedding_net.split("_")
+            if self.aggregation != "concat":
+                self.output_dim //= num_levels
+
             if self.embedding_net == 'resnet':
-                self.net = ResFieldNet50Hierarchical(3, 8)
+                self.net = ResFieldNet50Hierarchical(3, level_dim)
             elif self.embedding_net == 'unet14':
                 print('********************** Using UNet14 **********************')
-                self.net = MinkFieldUNet14A(3, 8)
-            elif self.embedding_net == 'unet14single':
-                print('********************** Using UNet14 **********************')
-                self.net = MinkFieldUNet14A(3, 32)
+                self.net = MinkFieldUNet14A(3, level_dim)
             elif self.embedding_net == 'minkvae':
                 print('********************** Using MinkVAE **********************')
                 self.net = MinkVAE(3, 64, 64, 8)
+            elif self.embedding_net == 'minkvqvae':
+                print('********************** Using MinkVQ-VAE **********************')
+                self.net = MinkVQVAE(
+                    in_channels=3,
+                    z_channels=256,
+                    num_emb=8192,
+                    gaussian_channels=4,
+                    emb_channels=8,
+                )
+            elif self.embedding_net == 'unet34':
+                print('********************** Using UNet34 **********************')
+                self.net = MinkFieldUNet34A(3, level_dim)
             elif self.embedding_net == 'unet50':
                 print('********************** Using UNet50 **********************')
-                self.net = MinkFieldUNet50Small(3, 8)
-            elif self.embedding_net == 'stylegan':
-                print('********************** Using StyleGAN2_3D **********************')
-                self.net = StyleGAN2_3D_Generator(z_dim=128, w_dim=128, num_blocks=5, 
-                                num_latent_mapping_layers=4, feature_out_channels=8, init_seed_channels=8)
+                self.net = MinkFieldUNet50Small(3, level_dim)
             elif self.embedding_net == 'styleunet':
                 print('********************** Using StyleUNet14 **********************')
-                self.net = StyleFieldUNet14A(3, 8, z_dim=128, w_dim=128, D=3)
+                self.net = StyleFieldUNet14A(3, 8, z_dim=z_dim, w_dim=z_dim, D=3)
+            elif self.embedding_net == 'stylegan':
+                print('********************** Using StyleGAN2_3D **********************')
+                self.net = StyleGAN2_3D_Generator(z_dim=z_dim, w_dim=z_dim, num_blocks=num_gan_blocks, 
+                                num_latent_mapping_layers=4, feature_out_channels=level_dim, 
+                                init_seed_channels=initseed_dim)
             elif self.embedding_net == 'bicyclegan':
                 print('********************** Using Bicycle-StyleGAN **********************')
-                self.net = StyleGAN2_3D_Generator(z_dim=128, w_dim=128, num_blocks=5,
-                                num_latent_mapping_layers=4, feature_out_channels=8, init_seed_channels=8)
-
+                self.net = StyleGAN2_3D_Generator(z_dim=z_dim, w_dim=z_dim, num_blocks=num_gan_blocks,
+                                num_latent_mapping_layers=4, feature_out_channels=level_dim, 
+                                init_seed_channels=initseed_dim)
+            else:
+                assert(False)
 
         self.pts_data = None
         self.embeddings = None
         self.posterior = None
+        self.vqloss = None
         self.density = {}
-        self.count = None
+        self.vis_count = 0
         self.emb_count = 0
         self.time_count = 900
         self.z_mu, self.z_logvar = None, None
+        self.func = lambda x: torch.cat([x, x[:1]], dim=0)
+        self.opt = opt
 
     def __repr__(self):
         return f"GridEncoderMinkowskiHierarchical: input_dim={self.input_dim} num_levels={self.num_levels} level_dim={self.level_dim} resolution={self.base_resolution} -> {int(round(self.base_resolution * self.per_level_scale ** (self.num_levels - 1)))} per_level_scale={self.per_level_scale:.4f} params={[(name, tuple(param.shape)) for name, param in self.named_parameters()]} gridtype={self.gridtype} align_corners={self.align_corners}"
@@ -390,51 +417,55 @@ class GridEncoderMinkowskiHierarchical(nn.Module):
         # print(self.pts_data['pts_coords'].shape) # [B, H, W, 3]
         # print(self.pts_data['pts_masks'].shape) # [B, H, W]
         # print(self.pts_data['pts_rgbs'].shape) # [B, H, W, 3]
-        func = lambda x: torch.cat([x, x[:1]], dim=0)
         if self.embeddings is None:
             pts = self.pts_data['pts_coords'][self.pts_data['pts_masks']]
             pts_batch = self.pts_data['pts_batch'][self.pts_data['pts_masks']].unsqueeze(-1) * 0
             pts_field = ME.TensorField(
-                features=func(self.pts_data['pts_rgbs'][self.pts_data['pts_masks']]),
-                coordinates=func(torch.cat([pts_batch, pts * self.scale], dim=-1)),
+                features=self.func(self.pts_data['pts_rgbs'][self.pts_data['pts_masks']]),
+                coordinates=self.func(torch.cat([pts_batch, pts * self.scale], dim=-1)),
                 quantization_mode=ME.SparseTensorQuantizationMode.UNWEIGHTED_AVERAGE,
                 minkowski_algorithm=ME.MinkowskiAlgorithm.SPEED_OPTIMIZED,
                 device=pts.device,
             )
-            # func1 = lambda x: torch.cat([torch.zeros_like(x[:, :1]), x], dim=1)
-            # mat = np.loadtxt("/home/lzq/lzy/denoising-diffusion-pytorch/test190dataaug/datavis/gamma_epoch20/data_3.txt")
-            # pts_field = ME.TensorField(
-            #     features=func(torch.from_numpy(mat[:, 3:]).to(pts.device).float() / 255.0),
-            #     coordinates=func(func1(torch.from_numpy(mat[:, :3]).to(pts.device).int())),
-            #     quantization_mode=ME.SparseTensorQuantizationMode.UNWEIGHTED_AVERAGE,
-            #     minkowski_algorithm=ME.MinkowskiAlgorithm.SPEED_OPTIMIZED,
-            #     device=pts.device,
-            # )
+
+            # self-defined data
+            if self.opt.feed_pc is not None:
+                cat_batch = lambda x: torch.cat([torch.zeros_like(x[:, :1]), x], dim=1)
+                mat = np.loadtxt(self.opt.feed_pc)
+                pts_field = ME.TensorField(
+                    features=self.func(torch.from_numpy(mat[:, 3:]).to(pts.device).float() / 255.0),
+                    coordinates=self.func(cat_batch(torch.from_numpy(mat[:, :3]).to(pts.device)) * self.scale),
+                    quantization_mode=ME.SparseTensorQuantizationMode.UNWEIGHTED_AVERAGE,
+                    minkowski_algorithm=ME.MinkowskiAlgorithm.SPEED_OPTIMIZED,
+                    device=pts.device,
+                )
 
             # print('  Compute embeddings')
             self.pts_sparse = pts_field#.sparse()
             if self.embedding_net == 'stylegan':
                 z = torch.randn(pts_batch.max()+1, self.net.z_dim).to(pts.device)
                 self.embeddings = self.net(self.pts_sparse.sparse(), z=z, update_emas=False)
-            elif self.embedding_net == 'styleunet':
-                z = torch.randn(pts_batch.max()+1, self.net.z_dim).to(pts.device)
-                self.embeddings = self.net(self.pts_sparse, z=z)
             elif self.embedding_net == 'bicyclegan':
-                if self.z_mu and self.z_logvar:
+                if self.z_mu != None and self.z_logvar != None:
                     std = torch.exp(self.z_logvar / 2)
                     z = torch.normal(mean=self.z_mu, std=std).to(pts.device)
                 else:
                     z = torch.randn(pts_batch.max()+1, self.net.z_dim).to(pts.device)
+                self.embeddings = self.net(self.pts_sparse.sparse(), z=z, update_emas=False)
+            elif self.embedding_net == 'styleunet':
+                z = torch.randn(pts_batch.max()+1, self.net.z_dim).to(pts.device)
                 self.embeddings = self.net(self.pts_sparse, z=z)
             elif self.embedding_net == 'minkvae':
                 self.embeddings, self.posterior = self.net(self.pts_sparse)
+            elif self.embedding_net == 'minkvqvae':
+                self.embeddings, self.vqloss, _ = self.net(self.pts_sparse)
             else:
                 self.embeddings = self.net(self.pts_sparse)
             # for emb in self.embeddings:
             #     print(emb.F.shape)
 
             if self.embedding_regu == 'tanh':
-                self.embeddings = tuple([replace_features(embedding, F.tanh(embedding.F)) for embedding in self.embeddings])
+                self.embeddings = tuple([replace_features(embedding, 10 * F.tanh(embedding.F / 10.0)) for embedding in self.embeddings])
             elif self.embedding_regu == 'normal':
                 def gaussian_norm(net_output):
                     mu = torch.mean(net_output, dim=0)
@@ -500,8 +531,8 @@ class GridEncoderMinkowskiHierarchical(nn.Module):
 
             if self.dual:
                 pts_field = ME.TensorField(
-                    features=func(self.pts_data['pts_rgbs'][self.pts_data['pts_masks']]),
-                    coordinates=func(torch.cat([pts_batch, pts * self.scale_dual], dim=-1)),
+                    features=self.func(self.pts_data['pts_rgbs'][self.pts_data['pts_masks']]),
+                    coordinates=self.func(torch.cat([pts_batch, pts * self.scale_dual], dim=-1)),
                     quantization_mode=ME.SparseTensorQuantizationMode.UNWEIGHTED_AVERAGE,
                     minkowski_algorithm=ME.MinkowskiAlgorithm.SPEED_OPTIMIZED,
                     device=pts.device,
@@ -511,24 +542,28 @@ class GridEncoderMinkowskiHierarchical(nn.Module):
             # print('  Use precomputed embeddings')
             pass
     
-        if self.count is not None:
-            with open(f'vis/{self.count:04d}.txt', 'w') as f:
+        if self.opt.visualize_point_cloud is not None:
+            import os
+            os.system(f"mkdir -p {self.opt.workspace}/{self.opt.visualize_point_cloud}")
+
+            # img = (255 * self.pts_data['pts_rgbs'][0].cpu().numpy()).astype(np.uint8)
+            # from PIL import Image
+            # Image.fromarray(img).save(f'vis/{self.count:04d}.jpg')
+
+            with open(f'{self.opt.workspace}/{self.opt.visualize_point_cloud}/{self.vis_count:04d}_pc.txt', 'w') as f:
                 for (_, x, y, z), (r, g, b) in zip(
-                    self.pts_sparse.C.cpu().numpy(),
+                    self.pts_sparse.C.cpu().numpy() / self.scale,
                     (255 * self.pts_sparse.F.cpu().numpy()).astype(np.uint8),
                 ):
                     f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
-            img = (255 * self.pts_data['pts_rgbs'][0].cpu().numpy()).astype(np.uint8)
-            from PIL import Image
-            Image.fromarray(img).save(f'vis/{self.count:04d}.jpg')
-
-            inputs = inputs[..., [2, 0, 1]]
-            query = inputs / bound / 2.0 * self.aabb_size * self.scale
-            with open(f'vis/query_{self.count:04d}.txt', 'w') as f:
-                for (x, y, z) in query.cpu().numpy():
-                    f.write('%.3lf %.3lf %.3lf\n' % (x, y, z))
-            self.count += 1
-            input("check")
+            
+            vox = self.pts_sparse.sparse()
+            with open(f'{self.opt.workspace}/{self.opt.visualize_point_cloud}/{self.vis_count:04d}_vox.txt', 'w') as f:
+                for (_, x, y, z), (r, g, b) in zip(
+                    vox.C.cpu().numpy() / self.scale,
+                    (255 * vox.F.cpu().numpy()).astype(np.uint8),
+                ):
+                    f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
 
         prefix_shape = list(inputs.shape[:-1])
         inputs = inputs[..., [2, 0, 1]]
@@ -537,18 +572,112 @@ class GridEncoderMinkowskiHierarchical(nn.Module):
         query = query.view(-1, 4)
         outputs = []
 
-        if self.embedding_net.endswith("single"):
-            outputs.append(self.embeddings[-1].features_at_coordinates(query).view(*prefix_shape, -1))
-        else:
+        if self.aggregation == "concat":
             for embedding in self.embeddings:
                 outputs.append(embedding.features_at_coordinates(query).view(*prefix_shape, -1))
+            outputs = torch.cat(outputs, dim=-1)
+        elif self.aggregation == "single":
+            outputs = self.embeddings[-1].features_at_coordinates(query).view(*prefix_shape, -1)
+        elif self.aggregation == "mean":
+            for embedding in self.embeddings:
+                outputs.append(embedding.features_at_coordinates(query).view(*prefix_shape, -1))
+            outputs = torch.stack(outputs).mean(dim=0)
+        elif self.aggregation == "alpha":
+            # xxx in a shape of (N, C)
+            add_ones = lambda tensor: torch.cat([tensor, torch.ones(tensor.shape[0], 1).to(tensor.device)], dim=1)
+            weights = []
+            for embedding in self.embeddings[::-1]: # fine to coarse
+                emb_cat_one = replace_features(embedding, add_ones(embedding.F))
+                queried = emb_cat_one.features_at_coordinates(query).view(*prefix_shape, -1)
+                outputs.append(queried[:, :-1])
+                weights.append(queried[:, -1:])
+            
+            rests = [torch.ones(query.shape[0], 1).to(query.device)]
+            new_weights = []
+            for i in range(len(weights)):
+                new_weights.append(rests[-1] * weights[i])
+                rests.append(rests[-1] * (1 - weights[i]))
+            
+            outputs = (torch.stack(outputs) * torch.stack(new_weights)).sum(dim=0)
+        elif self.aggregation == "point":
+            import frnn
+            output_field = self.embeddings[-1].slice(self.pts_sparse)
+            pts1 = query[:, 1:].unsqueeze(0)
+            pts2 = output_field.C[:, 1:].unsqueeze(0)
+            frnn_dists, frnn_idxs, frnn_nn, frnn_grid = frnn.frnn_grid_points(
+                pts1, pts2,
+                torch.Tensor([pts1.shape[1]]).to(pts1.device).long(),
+                torch.Tensor([pts2.shape[1]]).to(pts2.device).long(),
+                K=8, r=2.0, grid=None, return_nn=False, return_sorted=True,
+            )
+            # frnn_dists (N, P1, K)
+            # frnn_idxs (N, P1, K)
+            to_be_selected = torch.cat([output_field.F, output_field.F[:1] * 0.0], dim=0)
+            frnn_nnft = to_be_selected[frnn_idxs.flatten()].reshape(
+                frnn_idxs.shape[1], frnn_idxs.shape[2], output_field.F.shape[1]
+            ) # (P1, K, C)
+            frnn_weights = 1.0 / ((frnn_dists[0] + 1e-9) / self.scale / self.scale) # (P1, K) 1/d^2
+            frnn_weights = torch.nn.functional.relu(frnn_weights)
+            frnn_weights = torch.sqrt(frnn_weights)
+            frnn_weights = frnn_weights / (frnn_weights.sum(dim=-1, keepdim=True) + 1e-9)
+
+            outputs = torch.einsum("pkc, pk -> pc", frnn_nnft, frnn_weights)
+        
+        elif self.aggregation == "pointnormal":
+            import frnn
+            search_r = 2.0
+
+            normals = self.func(self.pts_data['pts_normal'][self.pts_data['pts_masks']])
+
+            output_field = self.embeddings[-1].slice(self.pts_sparse)
+            pts1 = query[:, 1:].unsqueeze(0)
+            pts2 = output_field.C[:, 1:].unsqueeze(0)
+            frnn_dists2, frnn_idxs, frnn_nn, frnn_grid = frnn.frnn_grid_points(
+                pts1, pts2,
+                torch.Tensor([pts1.shape[1]]).to(pts1.device).long(),
+                torch.Tensor([pts2.shape[1]]).to(pts2.device).long(),
+                K=8, r=search_r, grid=None, return_nn=True, return_sorted=True,
+            )
+            # pts1 (N, P1, 3)
+            # frnn_dists2 (N, P1, K)  -1 for invalid
+            # frnn_idxs (N, P1, K)  -1 for invalid
+            # frnn_nn (N, P1, K, 3) (0 0 0) for invalid
+            ft_to_sel = torch.cat([output_field.F, output_field.F[:1] * 0.0], dim=0) # for index -1
+            frnn_nnft = ft_to_sel[frnn_idxs.flatten()].reshape(
+                frnn_idxs.shape[1], frnn_idxs.shape[2], output_field.F.shape[1]
+            ) # (P1, K, C)
+
+            nml_to_sel = torch.cat([normals, normals[:1] * 0.0], dim=0) # for index -1
+            frnn_nnnml = nml_to_sel[frnn_idxs.flatten()].reshape(
+                frnn_idxs.shape[1], frnn_idxs.shape[2], 3
+            ) # (P1, K, 3) (0 0 0) for invalid
+            frnn_valid = (frnn_idxs[0] >= 0).float() # (P1, K)
+            frnn_invalid = 1.0 - frnn_valid
+            #           (P1, 1, 3)             (P1, K, 3)
+            pts1_diff = pts1[0].unsqueeze(1) - frnn_nn[0] # (P1, K, 3)
+            dir_norm2 = (pts1_diff * frnn_nnnml).sum(dim=-1) ** 2 # (P1, K) 0 for invalid or in-plane
+            pln_norm2 = frnn_dists2[0] - dir_norm2 # (P1, K) <=-1 for invalid
+
+            dir_norm = frnn_valid * torch.sqrt(dir_norm2) + frnn_invalid * search_r # search_r for invalid
+            pln_norm2 = frnn_valid * (pln_norm2 + 1e-9) - frnn_invalid # -1 for invalid
+
+            frnn_weights = 1.0 / (pln_norm2 / self.scale / self.scale) # (P1, K) 1/d^2
+            frnn_weights = torch.sqrt(torch.nn.functional.relu(frnn_weights)) # (P1, K) 1/d
+            frnn_weights = frnn_weights / (frnn_weights.sum(dim=-1, keepdim=True) + 1e-9)
+
+            weak_weights = torch.clamp((1 - (dir_norm / search_r) ** 8) ** 8, 0.0, 1.0)
+
+            weak_nnft = frnn_nnft * weak_weights.unsqueeze(-1)
+            outputs = torch.einsum("pkc, pk -> pc", weak_nnft, frnn_weights)
+
+        else:
+            assert(False)
         
         if self.dual:
             query *= float(np.sqrt(2))
             for embedding in self.embeddings_dual:
                 outputs.append(embedding.features_at_coordinates(query).view(*prefix_shape, -1))
 
-        outputs = torch.cat(outputs, dim=-1)
         return outputs
 
     def density_query(self, inputs, bound, n_voxel):
@@ -556,43 +685,70 @@ class GridEncoderMinkowskiHierarchical(nn.Module):
         # return: [..., num_levels * level_dim]
         assert(self.pts_data is not None)
         assert(type(self.density) == dict)
-        func = lambda x: torch.cat([x, x[:1]], dim=0)
-        offset = torch.Tensor([
-            [0, 0, 0, 0],
-            [0, 0, 0, 1],
-            [0, 0, 1, 0],
-            [0, 0, 1, 1],
-            [0, 1, 0, 0],
-            [0, 1, 0, 1],
-            [0, 1, 1, 0],
-            [0, 1, 1, 1],
-        ]).to(inputs.device)
+        # offset = torch.Tensor([
+        #     [0, 0, 0, 0],
+        #     [0, 0, 0, 1],
+        #     [0, 0, 1, 0],
+        #     [0, 0, 1, 1],
+        #     [0, 1, 0, 0],
+        #     [0, 1, 0, 1],
+        #     [0, 1, 1, 0],
+        #     [0, 1, 1, 1],
+        # ]).to(inputs.device)
         if n_voxel not in self.density:
             pts = self.pts_data['pts_coords'][self.pts_data['pts_masks']]
             pts_batch = self.pts_data['pts_batch'][self.pts_data['pts_masks']].unsqueeze(-1) * 0
-            coords = func(torch.cat([pts_batch, pts / self.aabb_size * n_voxel], dim=-1))
-            # mat = np.loadtxt("/home/lzq/lzy/denoising-diffusion-pytorch/test190dataaug/datavis/gamma_epoch20/data_3.txt")
-            # coords = (torch.from_numpy(mat[:, :3]) / self.scale).to(pts.device).float()
-            # coords = func(torch.cat([torch.zeros_like(coords[:, :1]), coords / self.aabb_size * n_voxel], dim=-1))
-            coords = torch.repeat_interleave(torch.floor(coords), 8, dim=0) + offset.repeat(coords.shape[0], 1)
+            coords = torch.cat([pts_batch, pts / self.aabb_size * n_voxel], dim=-1)
+
+            # self-defined data
+            if self.opt.feed_pc is not None:
+                mat = np.loadtxt(self.opt.feed_pc)
+                coords = torch.from_numpy(mat[:, :3]).to(pts.device).float()
+                coords = self.func(torch.cat([torch.zeros_like(coords[:, :1]), coords / self.aabb_size * n_voxel], dim=-1))
+
+            # coords = torch.repeat_interleave(torch.floor(coords), 8, dim=0) + offset.repeat(coords.shape[0], 1)
+
             self.density[n_voxel] = ME.TensorField(
-                features=torch.ones_like(coords[:, :1]),
-                coordinates=coords,
+                features=self.func(torch.ones_like(coords[:, :1])),
+                coordinates=self.func(coords),
                 quantization_mode=ME.SparseTensorQuantizationMode.UNWEIGHTED_AVERAGE,
                 minkowski_algorithm=ME.MinkowskiAlgorithm.SPEED_OPTIMIZED,
                 device=pts.device,
-            ).sparse()
+            )
 
-            # with open(f'vis/query_density.txt', 'w') as f:
-            #     for (_, x, y, z) in self.density.C.cpu().numpy():
-            #         f.write('%.3lf %.3lf %.3lf\n' % (x, y, z))
+            try:
+                self.density[n_voxel] = self.density[n_voxel].sparse()
+            except:
+                print(coords)
+                with open(f'query_density.txt', 'w') as f:
+                    for (_, x, y, z) in self.density[n_voxel].C.cpu().numpy():
+                        f.write('%.3lf %.3lf %.3lf\n' % (x, y, z))
+                input("see see")
         
         prefix_shape = list(inputs.shape[:-1])
         inputs = inputs[..., [2, 0, 1]]
         query = inputs / bound / 2.0 * n_voxel
         query = torch.cat([torch.zeros(*(prefix_shape + [1]), device=inputs.device), query], dim=-1)
         query = query.view(-1, 4)
-        return self.density[n_voxel].features_at_coordinates(query).view(*prefix_shape, -1)
+        query_density = self.density[n_voxel].features_at_coordinates(query).view(*prefix_shape, -1)
+
+        if self.opt.visualize_point_cloud is not None:
+            # hist, edges = np.histogram(query_density[query_density > 0].cpu().numpy(), bins=100, range=(0.0, 1.0))
+            # plt.plot(edges[:-1], hist)
+            # plt.savefig(f"{self.opt.workspace}/{self.opt.visualize_point_cloud}/density{n_voxel}.jpg")
+            # plt.clf()
+            import os
+            os.system(f"mkdir -p {self.opt.workspace}/{self.opt.visualize_point_cloud}")
+            vis_query = query / n_voxel * self.aabb_size
+            vis_mask = (query_density > 0)[..., 0]
+            density_colored = np.clip(query_density[..., 0][vis_mask].cpu().numpy(), 0.0, 1.0)
+            density_colored = plt.get_cmap("viridis")(density_colored)
+            density_colored = (density_colored * 255.0).astype(np.uint8)
+            with open(f'{self.opt.workspace}/{self.opt.visualize_point_cloud}/{self.vis_count:04d}_query_density{n_voxel}.txt', 'w') as f:
+                for (_, x, y, z), (r, g, b, _) in zip(vis_query[vis_mask].cpu().numpy(), density_colored):
+                    f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
+        
+        return query_density
 
 
 class GridEncoder(nn.Module):

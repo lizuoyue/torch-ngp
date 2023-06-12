@@ -33,15 +33,19 @@ def get_args():
     parser.add_argument('--tcnn', action='store_true', help="use TCNN backend")
     parser.add_argument('--encoding_net', type=str, default='hashgrid_minkowski_hierarchical', 
                         choices=['hashgrid_minkowski_hierarchical'])
-    parser.add_argument('--embedding_net', type=str, default='resnet', 
-                        choices=['resnet', 'unet50', 'unet14', 'unet14single', 'stylegan', 'styleunet', 'bicyclegan', "minkvae"])
+    parser.add_argument('--embedding_net', type=str, default='resnet')#, 
+                        # choices=['resnet', 'unet50', 'unet14', 'unet14single', 'stylegan', 'styleunet', 'bicyclegan', "minkvae", "minkvqvae"])
     parser.add_argument('--embedding_regu', type=str, default='none', choices=['none', 'normal', 'tanh', 'normal_loss'])
+    parser.add_argument('--embedding_dim', type=int, default=8)
+    parser.add_argument('--z_dim', type=int, default=128)
+    parser.add_argument('--initseed_dim', type=int, default=8)
+    parser.add_argument('--num_gan_blocks', type=int, default=5)
     parser.add_argument('--nerf_act', type=str, default='relu', choices=['lrelu', 'relu'])
     parser.add_argument('--downscale', type=int, default=1)
     parser.add_argument('--pts_scale', type=int, default=20)
     parser.add_argument('--depth_loss_weight', type=float, default=0.0)
     parser.add_argument('--color_loss_weight', type=float, default=1.0)
-    parser.add_argument('--kl_loss_weight', type=float, default=0.0)
+    parser.add_argument('--vae_loss_weight', type=float, default=0.0)
     parser.add_argument('--r1_gamma', type=float, default=0.0)
 
     ### StyleGAN2 options
@@ -54,6 +58,16 @@ def get_args():
     parser.add_argument('--random_x_flip', action='store_true')
     parser.add_argument('--random_y_flip', action='store_true')
     parser.add_argument('--random_z_rotate', action='store_true')
+    parser.add_argument('--disable_direction', action='store_true')
+    parser.add_argument('--sigma_softplus', action='store_true')
+    parser.add_argument('--eval_interval', type=int, default=1)
+    parser.add_argument('--feed_pc', type=str, default=None)
+    parser.add_argument('--visualize_point_cloud', type=str, default=None)
+    parser.add_argument('--grid_size', type=int, default=128)
+    parser.add_argument('--aabb_size', type=int, default=128) # meter
+    parser.add_argument('--use_self_sigma', action='store_true')
+    parser.add_argument('--use_image_weight', action='store_true')
+
     parser.add_argument('--random_gamma_correction', action='store_true')
     parser.add_argument('--diff_arg_dataset', type=str, default='train')
     parser.add_argument('--diff_arg_net_attention', type=str, default=None)
@@ -91,7 +105,7 @@ def get_args():
 if __name__ == '__main__':
 
     from nerf.provider import NeRFDataset
-    from nerf.gui import NeRFGUI
+    # from nerf.gui import NeRFGUI
     from nerf.utils import *
 
     from functools import partial
@@ -125,6 +139,8 @@ if __name__ == '__main__':
     
     seed_everything(opt.seed)
 
+    torch.autograd.set_detect_anomaly(True)
+
     model = NeRFNetwork(
         encoding=opt.encoding_net, # is 'hashgrid_minkowski_hierarchical' defaultly
         embedding_net=opt.embedding_net,
@@ -137,6 +153,12 @@ if __name__ == '__main__':
         density_thresh=opt.density_thresh,
         bg_radius=opt.bg_radius,
         activation=opt.nerf_act,
+        level_dim=opt.embedding_dim,
+        z_dim=opt.z_dim,
+        initseed_dim=opt.initseed_dim,
+        num_gan_blocks=opt.num_gan_blocks,
+        grid_size=opt.grid_size,
+        opt=opt,
     )
     
     print(model)
@@ -196,7 +218,7 @@ if __name__ == '__main__':
         trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, 
                     optimizer=optimizer, criterion=criterion, ema_decay=0.95, fp16=opt.fp16, 
                     lr_scheduler=scheduler, scheduler_update_every_step=scheduler_update_every_step, 
-                    metrics=metrics, use_checkpoint=opt.ckpt)#, eval_interval=50)
+                    metrics=metrics, use_checkpoint=opt.ckpt, eval_interval=opt.eval_interval)
 
         if opt.gui:
             gui = NeRFGUI(opt, trainer, train_loader)

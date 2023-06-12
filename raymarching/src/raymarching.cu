@@ -626,8 +626,10 @@ __global__ void kernel_composite_rays_train_backward(
     if (num_steps == 0 || offset + num_steps > M) return;
 
     grad_weights_sum += index;
+    grad_depth += index;
     grad_image += index * 3;
     weights_sum += index;
+    depth += index;
     image += index * 3;
     sigmas += offset;
     rgbs += offset * 3;

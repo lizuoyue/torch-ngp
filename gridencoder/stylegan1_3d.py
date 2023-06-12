@@ -463,7 +463,7 @@ class StyleGAN2_3D_Generator(torch.nn.Module):
         # self.init_coords_batch = lambda b: torch.cat([torch.ones(self.init_coords.shape[0], 1) * int(b), self.init_coords], dim=1)
         self.init_seed_features = torch.nn.Parameter(torch.randn(torch.prod(self.init_shape).int(), init_seed_channels))
 
-        self.block_out_channels = [256, 256, 128, 64, 32]
+        self.block_out_channels = [256, 512, 256, 128, 64] #[256, 256, 128, 64, 32]
         self.block_in_channels = [init_seed_channels] + self.block_out_channels[:-1]
 
         # SynthesisBlocks
@@ -749,12 +749,13 @@ class Latent_2D_Encoder(torch.nn.Module):
         self.z_dim = z_dim
         resnet18_model = resnet18(pretrained=False)
         self.feature_extractor = nn.Sequential(*list(resnet18_model.children())[:-3])
-        self.pooling = nn.AdaptiveAvgPool2d(output_ize=1)
+        self.pooling = nn.AdaptiveAvgPool2d(output_size=1)
         # Output is mu and log(var) for reparameterization trick used in VAEs
         self.fc_mu = nn.Linear(256, z_dim)
         self.fc_logvar = nn.Linear(256, z_dim)
 
     def forward(self, img):
+        img = img.reshape(1, 128, 128, 3).permute(0, 3, 1, 2).contiguous()
         out = self.feature_extractor(img)
         out = self.pooling(out)
         out = out.view(out.size(0), -1)

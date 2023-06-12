@@ -7,7 +7,7 @@ import tqdm
 import json
 import matplotlib; matplotlib.use("agg")
 import matplotlib.pyplot as plt
-import open3d as o3d
+# import open3d as o3d
 
 def dep_to_cam_coord(dep):
     y = np.arange(dep.shape[0])
@@ -28,14 +28,16 @@ class HoliCityDataset(Dataset):
         length = len(filter_[0])
         filter_ = set(filter_)
 
-        self.filelist = [f'{rootdir}/image-v1/{f}' for f in filelist if f[:length] in filter_]
+        self.filelist = [f'{rootdir}/{f}' for f in filelist if f[:length] in filter_]
         self.filelist.sort()
         if since_month is not None:
-            take_month = lambda s: s.split('/')[2]
+            take_month = lambda s: s.split('/')[-2]
             self.filelist = [f for f in self.filelist if take_month(f) >= since_month]
 
         self.size = len(self.filelist)
         print(f'num {split}:', self.size)
+        for i in range(10):
+            print(i, self.filelist[i])
 
         self.frames = []
         self.z_near = 0.05 # 5cm
@@ -55,8 +57,15 @@ class HoliCityDataset(Dataset):
         # print(idx + 1, '/', self.size, prefix)
         filename = prefix.split('/')[-1]
         basename = os.path.basename(prefix)
-        camera_prefix = prefix.replace('image', 'camr')
-        depth_prefix = prefix.replace('image', 'depth')
+        camera_prefix = prefix#.replace('image', 'camr')
+        depth_prefix = prefix#.replace('image', 'depth')
+
+        depth = np.load(f'{depth_prefix}_dpth.npz')["depth"][..., 0]
+        valid_map = (self.z_near <= depth) & (depth <= self.z_far)
+        if valid_map.mean() < 0.1:
+            print(prefix, 'invalid')
+            # np.savez_compressed(f'{self.save_folder}/depths/{filename}.npz', depth=depth[..., np.newaxis] * 0 + 0.2)
+            return
 
         img_pil = Image.open(f'{prefix}_imag.jpg')
         img_pil.save(f'{self.save_folder}/images/{filename}.jpg')
@@ -65,12 +74,7 @@ class HoliCityDataset(Dataset):
             c2w = np.linalg.inv(N['R'])
             c2w[:3, 3] *= 0
         
-        depth = np.load(f'{depth_prefix}_dpth.npz')["depth"][..., 0]
-        if (depth.max() < self.z_near) or (depth.min() > self.z_far):
-            print(prefix, 'invalid')
-            np.savez_compressed(f'{self.save_folder}/depths/{filename}.npz', depth=depth[..., np.newaxis] * 0 + 1)
-        else:
-            os.system(f'cp {depth_prefix}_dpth.npz {self.save_folder}/depths/{filename}.npz')
+        os.system(f'cp {depth_prefix}_dpth.npz {self.save_folder}/depths/{filename}.npz')
 
         mask = (self.z_near < depth) & (depth < self.z_far)
         
@@ -86,9 +90,9 @@ class HoliCityDataset(Dataset):
         pts = coord_wor.T[mask.flatten()]
         # np.savez_compressed(f'{self.save_folder}/coords/{filename}.npz', points=pts, mask=mask)
 
-        # with open(f'vis/{filename}.txt', 'w') as f:
-        #     for (x, y, z), (r, g, b) in zip(pts, np.array(img_pil)[mask]):
-        #         f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
+        with open(f'{self.save_folder}/{filename}.txt', 'w') as f:
+            for (x, y, z), (r, g, b) in zip(pts, np.array(img_pil)[mask]):
+                f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
         
         self.frames.append({
             "file_path": f"images/{filename}.jpg",
@@ -223,9 +227,9 @@ class HoliCityDataset(Dataset):
 
 if __name__ == '__main__':
 
-    dataset = HoliCityDataset('.', 'train', since_month='2018-01') # valid test
-    # dataset.create_save_folder('/home/lzq/lzy/torch-ngp/data/holicity_single_view')
-    for i in tqdm.tqdm(list(range(1600))): # len(dataset)
-        # dataset.save_single_data(i)
-        dataset.test_function(i)
-    # dataset.save_json()
+    dataset = HoliCityDataset('/cluster/project/cvg/zuoyue/HoliCity', 'train', since_month='2018-01') # valid test
+    dataset.create_save_folder('/cluster/project/cvg/zuoyue/torch-ngp/data/holicity_single_view_test')
+    for i in tqdm.tqdm(list(range(1600,1608))): # len(dataset)
+        dataset.save_single_data(i)
+        # dataset.test_function(i)
+    dataset.save_json()

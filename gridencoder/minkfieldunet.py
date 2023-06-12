@@ -326,15 +326,23 @@ class MinkFieldUNet14(MinkFieldUNetBase):
     BLOCK = BasicBlock
     LAYERS = (1, 1, 1, 1, 1, 1, 1, 1)
 
-class MinkFieldUNet14A(MinkFieldUNet14):
-    PLANES = (32, 64, 128, 256, 128, 128, 96, 96)
+class MinkFieldUNet34(MinkFieldUNetBase):
+    BLOCK = BasicBlock
+    LAYERS = (2, 3, 4, 6, 2, 2, 2, 2)
 
 class MinkFieldUNet50(MinkFieldUNetBase):
     BLOCK = Bottleneck
     LAYERS = (2, 3, 4, 6, 2, 2, 2, 2)
-    PLANES = (32, 64, 128, 256, 256, 128, 96, 96)
 
-class MinkFieldUNet50Small(MinkFieldUNetBase):
-    BLOCK = Bottleneck
-    LAYERS = (2, 3, 4, 6, 2, 2, 2, 2)
+
+class MinkFieldUNet14A(MinkFieldUNet14):
+    PLANES = (32, 64, 128, 256, 128, 128, 96, 96)
+
+class MinkFieldUNet34A(MinkFieldUNet34):
+    PLANES = (32, 64, 128, 256, 128, 128, 96, 96)
+
+class MinkFieldUNet50A(MinkFieldUNet50):
+    PLANES = (32, 64, 128, 256, 128, 128, 96, 96)
+
+class MinkFieldUNet50Small(MinkFieldUNet50):
     PLANES = (32, 64, 128, 256, 256//4, 128//4, 96//4, 96//4)
